@@ -35,6 +35,7 @@ pub const HTTP3_CONTROL_STREAM_TYPE_ID: u64 = 0x0;
 pub const HTTP3_PUSH_STREAM_TYPE_ID: u64 = 0x1;
 pub const QPACK_ENCODER_STREAM_TYPE_ID: u64 = 0x2;
 pub const QPACK_DECODER_STREAM_TYPE_ID: u64 = 0x3;
+pub const WEBTRANSPORT_STREAM_TYPE_ID: u64 = 0x54;
 
 const MAX_STATE_BUF_SIZE: usize = (1 << 24) - 1;
 
@@ -45,6 +46,7 @@ pub enum Type {
     Push,
     QpackEncoder,
     QpackDecoder,
+    WebTransport,
     Unknown,
 }
 
@@ -61,6 +63,12 @@ pub enum State {
 
     /// Reading the stream's current frame's payload.
     FramePayload,
+
+    /// Reading the WebTransport sessionId.
+    WebTransportSessionId,
+
+    /// Reading the WebTransport data.
+    WebTransportStreamData,
 
     /// Reading DATA payload.
     Data,
@@ -85,6 +93,7 @@ impl Type {
             HTTP3_PUSH_STREAM_TYPE_ID => Ok(Type::Push),
             QPACK_ENCODER_STREAM_TYPE_ID => Ok(Type::QpackEncoder),
             QPACK_DECODER_STREAM_TYPE_ID => Ok(Type::QpackDecoder),
+            WEBTRANSPORT_STREAM_TYPE_ID => Ok(Type::WebTransport),
 
             _ => Ok(Type::Unknown),
         }
@@ -130,6 +139,9 @@ pub struct Stream {
     /// The type of the frame currently being parsed.
     frame_type: Option<u64>,
 
+    /// The WebTransport session id currently being parsed.
+    webtransport_session_id: Option<u64>,
+
     /// Whether the stream was created locally, or by the peer.
     is_local: bool,
 
@@ -141,6 +153,9 @@ pub struct Stream {
 
     /// Whether a `Data` event has been triggered for this stream.
     data_event_triggered: bool,
+
+    /// Whether a `WebTransportStreamData` event has been triggered for this stream.
+    webtransport_data_event_triggered: bool,
 }
 
 impl Stream {
@@ -174,11 +189,15 @@ impl Stream {
 
             frame_type: None,
 
+            webtransport_session_id: None,
+
             is_local,
             remote_initialized: false,
             local_initialized: false,
 
             data_event_triggered: false,
+
+            webtransport_data_event_triggered: false,
         }
     }
 
@@ -190,14 +209,20 @@ impl Stream {
         self.state
     }
 
+    pub fn webtransport_session_id(&self) -> Option<u64> {
+        self.webtransport_session_id
+    }
+
     /// Sets the stream's type and transitions to the next state.
     pub fn set_ty(&mut self, ty: Type) -> Result<()> {
         assert_eq!(self.state, State::StreamType);
 
         self.ty = Some(ty);
 
-        let state = match ty {
+        let state = match &ty {
             Type::Control | Type::Request => State::FrameType,
+
+            Type::WebTransport => State::WebTransportSessionId,
 
             Type::Push => State::PushId,
 
@@ -230,6 +255,8 @@ impl Stream {
     pub fn set_frame_type(&mut self, ty: u64) -> Result<()> {
         assert_eq!(self.state, State::FrameType);
 
+        let mut next_state = State::FramePayloadLen;
+
         // Only expect frames on Control, Request and Push streams.
         match self.ty {
             Some(Type::Control) => {
@@ -254,6 +281,9 @@ impl Stream {
                     (frame::DATA_FRAME_TYPE_ID, true) =>
                         return Err(Error::FrameUnexpected),
 
+                    (frame::WEBTRANSPORT_FRAME_TYPE_ID, _) =>
+                        return Err(Error::FrameUnexpected),
+
                     (frame::HEADERS_FRAME_TYPE_ID, true) =>
                         return Err(Error::FrameUnexpected),
 
@@ -276,6 +306,16 @@ impl Stream {
                         (frame::DATA_FRAME_TYPE_ID, false) =>
                             return Err(Error::FrameUnexpected),
 
+                        (frame::WEBTRANSPORT_FRAME_TYPE_ID, true) => {
+                            self.local_initialized = true;
+                            next_state = State::WebTransportSessionId;
+                        }
+
+                        (frame::WEBTRANSPORT_FRAME_TYPE_ID, false) => {
+                            self.remote_initialized = true;
+                            next_state = State::WebTransportSessionId;
+                        }
+
                         (frame::CANCEL_PUSH_FRAME_TYPE_ID, _) =>
                             return Err(Error::FrameUnexpected),
 
@@ -290,6 +330,30 @@ impl Stream {
 
                         // All other frames can be ignored regardless of stream
                         // state.
+                        _ => (),
+                    }
+                } else {
+                    match (ty, self.remote_initialized) {
+                        (frame::WEBTRANSPORT_FRAME_TYPE_ID, true) =>
+                            return Err(Error::FrameUnexpected),
+
+                        (frame::WEBTRANSPORT_FRAME_TYPE_ID, false) => {
+                            self.remote_initialized = true;
+                            next_state = State::WebTransportSessionId;
+                        },
+
+                        (frame::CANCEL_PUSH_FRAME_TYPE_ID, _) =>
+                            return Err(Error::FrameUnexpected),
+
+                        (frame::SETTINGS_FRAME_TYPE_ID, _) =>
+                            return Err(Error::FrameUnexpected),
+
+                        (frame::GOAWAY_FRAME_TYPE_ID, _) =>
+                            return Err(Error::FrameUnexpected),
+
+                        (frame::MAX_PUSH_FRAME_TYPE_ID, _) =>
+                            return Err(Error::FrameUnexpected),
+
                         _ => (),
                     }
                 }
@@ -322,9 +386,22 @@ impl Stream {
 
         self.frame_type = Some(ty);
 
-        self.state_transition(State::FramePayloadLen, 1, true)?;
+        self.state_transition(next_state, 1, true)?;
 
         Ok(())
+    }
+
+    pub fn set_webtransport_session_id(&mut self, session_id: u64) -> Result<()> {
+        assert_eq!(self.state, State::WebTransportSessionId);
+
+        if self.ty == Some(Type::Request) ||
+            self.ty == Some(Type::WebTransport)
+        {
+            self.webtransport_session_id = Some(session_id);
+            self.state_transition(State::WebTransportStreamData, 0, false)?;
+            return Ok(());
+        }
+        Err(Error::InternalError)
     }
 
     /// Sets the frame's payload length and transitions to the next state.
@@ -490,6 +567,33 @@ impl Stream {
         Ok((len, fin))
     }
 
+    pub fn try_consume_webtransport_data(
+        &mut self, conn: &mut crate::Connection, out: &mut [u8],
+    ) -> Result<(usize, bool)> {
+        let udp_mtu = 1350;
+        let left = std::cmp::min(out.len(), udp_mtu);
+
+        let (len, fin) = match conn.stream_recv(self.id, &mut out[..left]) {
+            Ok(v) => v,
+
+            Err(e) => {
+                // The stream is not readable anymore, so re-arm the WebTransportStreamData event.
+                if e == crate::Error::Done {
+                    self.reset_webtransport_data_event();
+                }
+
+                return Err(e.into());
+            },
+        };
+
+        // The stream is not readable anymore, so re-arm the WebTransportStreamData event.
+        if !conn.stream_readable(self.id) {
+            self.reset_webtransport_data_event();
+        }
+
+        Ok((len, fin))
+    }
+
     /// Marks the stream as finished.
     pub fn finished(&mut self) {
         let _ = self.state_transition(State::Finished, 0, false);
@@ -533,6 +637,21 @@ impl Stream {
     /// Resets the data triggered state.
     fn reset_data_event(&mut self) {
         self.data_event_triggered = false;
+    }
+
+    pub fn try_trigger_webtransport_data_event(&mut self) -> bool {
+        if self.webtransport_data_event_triggered {
+            return false;
+        }
+
+        self.webtransport_data_event_triggered = true;
+
+        true
+    }
+
+    /// Resets the data triggered state.
+    fn reset_webtransport_data_event(&mut self) {
+        self.webtransport_data_event_triggered = false;
     }
 
     /// Returns true if the state buffer has enough data to complete the state.
@@ -592,6 +711,7 @@ mod tests {
             qpack_max_table_capacity: Some(0),
             qpack_blocked_streams: Some(0),
             h3_datagram: None,
+            enable_webtransport: None,
             grease: None,
             raw: Some(raw_settings),
         };
@@ -655,6 +775,7 @@ mod tests {
             qpack_max_table_capacity: Some(0),
             qpack_blocked_streams: Some(0),
             h3_datagram: None,
+            enable_webtransport: None,
             grease: None,
             raw: Some(raw_settings),
         };
@@ -727,6 +848,7 @@ mod tests {
             qpack_max_table_capacity: Some(0),
             qpack_blocked_streams: Some(0),
             h3_datagram: None,
+            enable_webtransport: None,
             grease: None,
             raw: Some(raw_settings),
         };
@@ -778,6 +900,7 @@ mod tests {
             qpack_max_table_capacity: Some(0),
             qpack_blocked_streams: Some(0),
             h3_datagram: None,
+            enable_webtransport: None,
             grease: None,
             raw: Some(raw_settings),
         };

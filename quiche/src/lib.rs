@@ -4336,7 +4336,8 @@ impl Connection {
         }
     }
 
-    fn dgram_enabled(&self) -> bool {
+    /// Returns true if datagram enabled
+    pub fn dgram_enabled(&self) -> bool {
         self.local_transport_params
             .max_datagram_frame_size
             .is_some()

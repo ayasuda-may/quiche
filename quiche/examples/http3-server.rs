@@ -350,6 +350,8 @@ fn main() {
                             );
                         },
 
+                        Ok((_stream_id, quiche::h3::Event::WebTransportStreamData(_session_id))) => (),
+
                         Ok((stream_id, quiche::h3::Event::Data)) => {
                             info!(
                                 "{} got data on stream id {}",
