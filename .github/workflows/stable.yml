@@ -50,13 +50,19 @@ jobs:
         uses: actions-rs/cargo@v1
         with:
           command: clippy
+          args: --features=ffi,qlog -- -D warnings
+
+      - name: Run cargo clippy on examples
+        uses: actions-rs/cargo@v1
+        with:
+          command: clippy
           args: --examples --features=ffi,qlog -- -D warnings
 
       - name: Run cargo doc
         uses: actions-rs/cargo@v1
         with:
           command: doc
-          args: --no-deps
+          args: --no-deps --all-features --document-private-items
 
       - name: Build C examples
         run: |
@@ -126,7 +132,7 @@ jobs:
           args: --target=${{ matrix.target }} --verbose
 
   quiche_windows:
-    runs-on: windows-latest
+    runs-on: windows-2019
     strategy:
       matrix:
         target: ["x86_64-pc-windows-msvc", "i686-pc-windows-msvc"]

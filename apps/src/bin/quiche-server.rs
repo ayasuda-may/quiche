@@ -43,12 +43,12 @@ use quiche_apps::args::*;
 
 use quiche_apps::common::*;
 
+const MAX_BUF_SIZE: usize = 65535;
+
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
-const MAX_SEND_BURST_LIMIT: usize = MAX_DATAGRAM_SIZE * 10;
-
 fn main() {
-    let mut buf = [0; 65535];
+    let mut buf = [0; MAX_BUF_SIZE];
     let mut out = [0; MAX_DATAGRAM_SIZE];
 
     env_logger::builder()
@@ -61,22 +61,17 @@ fn main() {
     let args = ServerArgs::with_docopt(&docopt);
 
     // Setup the event loop.
-    let poll = mio::Poll::new().unwrap();
+    let mut poll = mio::Poll::new().unwrap();
     let mut events = mio::Events::with_capacity(1024);
 
     // Create the UDP listening socket, and register it with the event loop.
-    let socket = net::UdpSocket::bind(args.listen).unwrap();
-
+    let mut socket =
+        mio::net::UdpSocket::bind(args.listen.parse().unwrap()).unwrap();
     info!("listening on {:}", socket.local_addr().unwrap());
 
-    let socket = mio::net::UdpSocket::from_socket(socket).unwrap();
-    poll.register(
-        &socket,
-        mio::Token(0),
-        mio::Ready::readable(),
-        mio::PollOpt::edge(),
-    )
-    .unwrap();
+    poll.registry()
+        .register(&mut socket, mio::Token(0), mio::Interest::READABLE)
+        .unwrap();
 
     // Create the configuration for the QUIC connections.
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
@@ -238,7 +233,7 @@ fn main() {
 
                     let out = &out[..len];
 
-                    if let Err(e) = socket.send_to(out, &from) {
+                    if let Err(e) = socket.send_to(out, from) {
                         if e.kind() == std::io::ErrorKind::WouldBlock {
                             trace!("send() would block");
                             break;
@@ -277,7 +272,7 @@ fn main() {
 
                         let out = &out[..len];
 
-                        if let Err(e) = socket.send_to(out, &from) {
+                        if let Err(e) = socket.send_to(out, from) {
                             if e.kind() == std::io::ErrorKind::WouldBlock {
                                 trace!("send() would block");
                                 break;
@@ -461,6 +456,10 @@ fn main() {
         // packets to be sent.
         continue_write = false;
         for client in clients.values_mut() {
+            let max_send_burst = client.conn.send_quantum().min(MAX_BUF_SIZE) /
+                MAX_DATAGRAM_SIZE *
+                MAX_DATAGRAM_SIZE;
+
             loop {
                 let (write, send_info) = match client.conn.send(&mut out) {
                     Ok(v) => v,
@@ -479,7 +478,7 @@ fn main() {
                 };
 
                 // TODO: coalesce packets.
-                if let Err(e) = socket.send_to(&out[..write], &send_info.to) {
+                if let Err(e) = socket.send_to(&out[..write], send_info.to) {
                     if e.kind() == std::io::ErrorKind::WouldBlock {
                         trace!("send() would block");
                         break;
@@ -493,7 +492,7 @@ fn main() {
                 // limit write bursting
                 client.bytes_sent += write;
 
-                if client.bytes_sent >= MAX_SEND_BURST_LIMIT {
+                if client.bytes_sent >= max_send_burst {
                     trace!(
                         "{} pause writing at {}",
                         client.conn.trace_id(),

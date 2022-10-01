@@ -748,6 +748,11 @@ impl ServerSession {
                 }
             },
 
+	    /// priority update available in 0.14.0
+	    /// optional event implementation for webtransport
+	    /// TBC A. Yasuda
+	    Ok((_, PriorityUpdate)) => todo!(),
+	    
             Ok((stream_id, h3::Event::WebTransportStreamData(session_id))) => {
                 match self.state {
                     ServerState::Connected(sid) => {
@@ -1231,6 +1236,12 @@ impl ClientSession {
                 _ => Ok(ClientEvent::Other(stream_id, h3::Event::GoAway)),
             },
 
+	    /// priority update available in 0.14.0
+	    /// optional event implementation for webtransport
+	    /// client request
+	    /// TBC A. Yasuda
+	    Ok((_, PriorityUpdate)) => todo!(),
+	    
             Err(h3::Error::Done) => Err(Error::Done),
 
             Err(e) => Err(e.into()),

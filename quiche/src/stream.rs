@@ -472,6 +472,11 @@ impl StreamMap {
         self.local_max_streams_bidi = self.local_max_streams_bidi_next;
     }
 
+    /// Returns the current max_streams_bidi limit.
+    pub fn max_streams_bidi(&self) -> u64 {
+        self.local_max_streams_bidi
+    }
+
     /// Returns the new max_streams_bidi limit.
     pub fn max_streams_bidi_next(&mut self) -> u64 {
         self.local_max_streams_bidi_next
@@ -548,6 +553,11 @@ impl StreamMap {
     /// Creates an iterator over streams that need to send STOP_SENDING.
     pub fn stopped(&self) -> hash_map::Iter<u64, u64> {
         self.stopped.iter()
+    }
+
+    /// Returns true if the stream has been collected.
+    pub fn is_collected(&self, stream_id: u64) -> bool {
+        self.collected.contains(&stream_id)
     }
 
     /// Returns true if there are any streams that have data to write.
@@ -1082,6 +1092,9 @@ pub struct SendBuf {
     /// The maximum offset we are allowed to send to the peer.
     max_data: u64,
 
+    /// The last offset the stream was blocked at, if any.
+    blocked_at: Option<u64>,
+
     /// The final stream offset written to the stream, if any.
     fin_off: Option<u64>,
 
@@ -1234,6 +1247,16 @@ impl SendBuf {
     /// Updates the max_data limit to the given value.
     pub fn update_max_data(&mut self, max_data: u64) {
         self.max_data = cmp::max(self.max_data, max_data);
+    }
+
+    /// Updates the last offset the stream was blocked at, if any.
+    pub fn update_blocked_at(&mut self, blocked_at: Option<u64>) {
+        self.blocked_at = blocked_at;
+    }
+
+    /// The last offset the stream was blocked at, if any.
+    pub fn blocked_at(&self) -> Option<u64> {
+        self.blocked_at
     }
 
     /// Increments the acked data offset.

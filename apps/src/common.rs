@@ -33,6 +33,9 @@ use std::io::prelude::*;
 
 use std::collections::HashMap;
 
+#[cfg(feature = "sfv")]
+use std::convert::TryFrom;
+
 use std::fmt::Write as _;
 
 use std::rc::Rc;
@@ -48,6 +51,8 @@ use quiche::h3::NameValue;
 pub fn stdout_sink(out: String) {
     print!("{}", out);
 }
+
+const H3_MESSAGE_ERROR: u64 = 0x10E;
 
 /// ALPN helpers.
 ///
@@ -83,7 +88,7 @@ pub struct PartialResponse {
 }
 
 pub struct Client {
-    pub conn: std::pin::Pin<Box<quiche::Connection>>,
+    pub conn: quiche::Connection,
 
     pub http_conn: Option<Box<dyn HttpConn>>,
 
@@ -185,9 +190,7 @@ fn dump_json(reqs: &[Http3Request], output_sink: &mut dyn FnMut(String)) {
             writeln!(
                 out,
                 "          \"value\": \"{}\"",
-                std::str::from_utf8(h.value())
-                    .unwrap()
-                    .replace("\"", "\\\"")
+                std::str::from_utf8(h.value()).unwrap().replace('"', "\\\"")
             )
             .unwrap();
 
@@ -214,9 +217,7 @@ fn dump_json(reqs: &[Http3Request], output_sink: &mut dyn FnMut(String)) {
             writeln!(
                 out,
                 "          \"value\": \"{}\"",
-                std::str::from_utf8(h.value())
-                    .unwrap()
-                    .replace("\"", "\\\"")
+                std::str::from_utf8(h.value()).unwrap().replace('"', "\\\"")
             )
             .unwrap();
 
@@ -242,6 +243,17 @@ fn dump_json(reqs: &[Http3Request], output_sink: &mut dyn FnMut(String)) {
     output_sink(out);
 }
 
+pub fn hdrs_to_strings(hdrs: &[quiche::h3::Header]) -> Vec<(String, String)> {
+    hdrs.iter()
+        .map(|h| {
+            (
+                String::from_utf8(h.name().into()).unwrap(),
+                String::from_utf8(h.value().into()).unwrap(),
+            )
+        })
+        .collect()
+}
+
 pub trait HttpConn {
     fn send_requests(
         &mut self, conn: &mut quiche::Connection, target_path: &Option<String>,
@@ -255,14 +267,14 @@ pub trait HttpConn {
     fn report_incomplete(&self, start: &std::time::Instant) -> bool;
 
     fn handle_requests(
-        &mut self, conn: &mut std::pin::Pin<Box<quiche::Connection>>,
+        &mut self, conn: &mut quiche::Connection,
         partial_requests: &mut HashMap<u64, PartialRequest>,
         partial_responses: &mut HashMap<u64, PartialResponse>, root: &str,
         index: &str, buf: &mut [u8],
     ) -> quiche::h3::Result<()>;
 
     fn handle_writable(
-        &mut self, conn: &mut std::pin::Pin<Box<quiche::Connection>>,
+        &mut self, conn: &mut quiche::Connection,
         partial_responses: &mut HashMap<u64, PartialResponse>, stream_id: u64,
     );
 }
@@ -443,6 +455,11 @@ struct Http3Request {
     response_writer: Option<std::io::BufWriter<std::fs::File>>,
 }
 
+type Http3ResponseBuilderResult = std::result::Result<
+    (Vec<quiche::h3::Header>, Vec<u8>, quiche::h3::Priority),
+    (u64, String),
+>;
+
 pub struct Http09Conn {
     stream_id: u64,
     reqs_sent: usize,
@@ -621,7 +638,7 @@ impl HttpConn for Http09Conn {
     }
 
     fn handle_requests(
-        &mut self, conn: &mut std::pin::Pin<Box<quiche::Connection>>,
+        &mut self, conn: &mut quiche::Connection,
         partial_requests: &mut HashMap<u64, PartialRequest>,
         partial_responses: &mut HashMap<u64, PartialResponse>, root: &str,
         index: &str, buf: &mut [u8],
@@ -729,7 +746,7 @@ impl HttpConn for Http09Conn {
     }
 
     fn handle_writable(
-        &mut self, conn: &mut std::pin::Pin<Box<quiche::Connection>>,
+        &mut self, conn: &mut quiche::Connection,
         partial_responses: &mut HashMap<u64, PartialResponse>, stream_id: u64,
     ) {
         trace!("{} stream {} is writable", conn.trace_id(), stream_id);
@@ -903,43 +920,178 @@ impl Http3Conn {
     /// Builds an HTTP/3 response given a request.
     fn build_h3_response(
         root: &str, index: &str, request: &[quiche::h3::Header],
-    ) -> (Vec<quiche::h3::Header>, Vec<u8>, String) {
+    ) -> Http3ResponseBuilderResult {
         let mut file_path = path::PathBuf::from(root);
-        let mut scheme = "";
-        let mut host = "";
-        let mut path = "";
-        let mut method = "";
-        let mut priority = "";
+        let mut scheme = None;
+        let mut authority = None;
+        let mut host = None;
+        let mut path = None;
+        let mut method = None;
+        let mut priority = vec![];
 
         // Parse some of the request headers.
         for hdr in request {
             match hdr.name() {
-                b":scheme" => scheme = std::str::from_utf8(hdr.value()).unwrap(),
+                b":scheme" => {
+                    if scheme.is_some() {
+                        return Err((
+                            H3_MESSAGE_ERROR,
+                            ":scheme cannot be duplicated".to_string(),
+                        ));
+                    }
 
-                b":authority" | b"host" =>
-                    host = std::str::from_utf8(hdr.value()).unwrap(),
+                    scheme = Some(std::str::from_utf8(hdr.value()).unwrap());
+                },
 
-                b":path" => path = std::str::from_utf8(hdr.value()).unwrap(),
+                b":authority" => {
+                    if authority.is_some() {
+                        return Err((
+                            H3_MESSAGE_ERROR,
+                            ":authority cannot be duplicated".to_string(),
+                        ));
+                    }
 
-                b":method" => method = std::str::from_utf8(hdr.value()).unwrap(),
+                    authority = Some(std::str::from_utf8(hdr.value()).unwrap());
+                },
 
-                b"priority" =>
-                    priority = std::str::from_utf8(hdr.value()).unwrap(),
+                b":path" => {
+                    if path.is_some() {
+                        return Err((
+                            H3_MESSAGE_ERROR,
+                            ":path cannot be duplicated".to_string(),
+                        ));
+                    }
+
+                    path = Some(std::str::from_utf8(hdr.value()).unwrap())
+                },
+
+                b":method" => {
+                    if method.is_some() {
+                        return Err((
+                            H3_MESSAGE_ERROR,
+                            ":method cannot be duplicated".to_string(),
+                        ));
+                    }
+
+                    method = Some(std::str::from_utf8(hdr.value()).unwrap())
+                },
+
+                b"priority" => priority = hdr.value().to_vec(),
+
+                b"host" => host = Some(std::str::from_utf8(hdr.value()).unwrap()),
 
                 _ => (),
             }
         }
 
-        if scheme != "http" && scheme != "https" {
-            let headers = vec![
-                quiche::h3::Header::new(b":status", "400".to_string().as_bytes()),
-                quiche::h3::Header::new(b"server", b"quiche"),
-            ];
+        let decided_method = match method {
+            Some(method) => {
+                match method {
+                    "" =>
+                        return Err((
+                            H3_MESSAGE_ERROR,
+                            ":method value cannot be empty".to_string(),
+                        )),
 
-            return (headers, b"Invalid scheme".to_vec(), priority.to_string());
-        }
+                    "CONNECT" => {
+                        // not allowed
+                        let headers = vec![
+                            quiche::h3::Header::new(
+                                b":status",
+                                "405".to_string().as_bytes(),
+                            ),
+                            quiche::h3::Header::new(b"server", b"quiche"),
+                        ];
 
-        let url = format!("{}://{}{}", scheme, host, path);
+                        return Ok((headers, b"".to_vec(), Default::default()));
+                    },
+
+                    _ => method,
+                }
+            },
+
+            None =>
+                return Err((
+                    H3_MESSAGE_ERROR,
+                    ":method cannot be missing".to_string(),
+                )),
+        };
+
+        let decided_scheme = match scheme {
+            Some(scheme) => {
+                if scheme != "http" && scheme != "https" {
+                    let headers = vec![
+                        quiche::h3::Header::new(
+                            b":status",
+                            "400".to_string().as_bytes(),
+                        ),
+                        quiche::h3::Header::new(b"server", b"quiche"),
+                    ];
+
+                    return Ok((
+                        headers,
+                        b"Invalid scheme".to_vec(),
+                        Default::default(),
+                    ));
+                }
+
+                scheme
+            },
+
+            None =>
+                return Err((
+                    H3_MESSAGE_ERROR,
+                    ":scheme cannot be missing".to_string(),
+                )),
+        };
+
+        let decided_host = match (authority, host) {
+            (None, Some("")) =>
+                return Err((
+                    H3_MESSAGE_ERROR,
+                    "host value cannot be empty".to_string(),
+                )),
+
+            (Some(""), None) =>
+                return Err((
+                    H3_MESSAGE_ERROR,
+                    ":authority value cannot be empty".to_string(),
+                )),
+
+            (Some(""), Some("")) =>
+                return Err((
+                    H3_MESSAGE_ERROR,
+                    ":authority and host value cannot be empty".to_string(),
+                )),
+
+            (None, None) =>
+                return Err((
+                    H3_MESSAGE_ERROR,
+                    ":authority and host missing".to_string(),
+                )),
+
+            // Any other combo, prefer :authority
+            (..) => authority.unwrap(),
+        };
+
+        let decided_path = match path {
+            Some("") =>
+                return Err((
+                    H3_MESSAGE_ERROR,
+                    ":path value cannot be empty".to_string(),
+                )),
+
+            None =>
+                return Err((
+                    H3_MESSAGE_ERROR,
+                    ":path cannot be missing".to_string(),
+                )),
+
+            Some(path) => path,
+        };
+
+        let url =
+            format!("{}://{}{}", decided_scheme, decided_host, decided_path);
         let url = url::Url::parse(&url).unwrap();
 
         let pathbuf = path::PathBuf::from(url.path());
@@ -959,10 +1111,12 @@ impl Http3Conn {
         }
 
         if !query_priority.is_empty() {
-            priority = &query_priority;
+            // remove trailing comma
+            query_priority.pop();
+            priority = query_priority.as_bytes().to_vec();
         }
 
-        let (status, body) = match method {
+        let (status, body) = match decided_method {
             "GET" => {
                 for c in pathbuf.components() {
                     if let path::Component::Normal(v) = c {
@@ -991,10 +1145,19 @@ impl Http3Conn {
 
         if !priority.is_empty() {
             headers
-                .push(quiche::h3::Header::new(b"priority", priority.as_bytes()));
+                .push(quiche::h3::Header::new(b"priority", priority.as_slice()));
         }
 
-        (headers, body, priority.to_string())
+        #[cfg(feature = "sfv")]
+        let priority = match quiche::h3::Priority::try_from(priority.as_slice()) {
+            Ok(v) => v,
+            Err(_) => quiche::h3::Priority::default(),
+        };
+
+        #[cfg(not(feature = "sfv"))]
+        let priority = quiche::h3::Priority::default();
+
+        Ok((headers, body, priority))
     }
 }
 
@@ -1031,7 +1194,7 @@ impl HttpConn for Http3Conn {
                 },
             };
 
-            debug!("Sent HTTP request {:?}", req.hdrs);
+            debug!("Sent HTTP request {:?}", hdrs_to_strings(&req.hdrs));
 
             req.stream_id = Some(s);
             req.response_writer =
@@ -1111,7 +1274,8 @@ impl HttpConn for Http3Conn {
                 Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
                     debug!(
                         "got response headers {:?} on stream id {}",
-                        list, stream_id
+                        hdrs_to_strings(&list),
+                        stream_id
                     );
 
                     let req = self
@@ -1222,6 +1386,17 @@ impl HttpConn for Http3Conn {
                     }
                 },
 
+                Ok((
+                    prioritized_element_id,
+                    quiche::h3::Event::PriorityUpdate,
+                )) => {
+                    info!(
+                        "{} PRIORITY_UPDATE triggered for element ID={}",
+                        conn.trace_id(),
+                        prioritized_element_id
+                    );
+                },
+
                 Ok((goaway_id, quiche::h3::Event::GoAway)) => {
                     info!(
                         "{} got GOAWAY with ID {} ",
@@ -1263,7 +1438,7 @@ impl HttpConn for Http3Conn {
     }
 
     fn handle_requests(
-        &mut self, conn: &mut std::pin::Pin<Box<quiche::Connection>>,
+        &mut self, conn: &mut quiche::Connection,
         _partial_requests: &mut HashMap<u64, PartialRequest>,
         partial_responses: &mut HashMap<u64, PartialResponse>, root: &str,
         index: &str, buf: &mut [u8],
@@ -1275,7 +1450,7 @@ impl HttpConn for Http3Conn {
                     info!(
                         "{} got request {:?} on stream id {}",
                         conn.trace_id(),
-                        &list,
+                        hdrs_to_strings(&list),
                         stream_id
                     );
 
@@ -1290,7 +1465,24 @@ impl HttpConn for Http3Conn {
                         .unwrap();
 
                     let (headers, body, priority) =
-                        Http3Conn::build_h3_response(root, index, &list);
+                        match Http3Conn::build_h3_response(root, index, &list) {
+                            Ok(v) => v,
+
+                            Err((error_code, _)) => {
+                                conn.stream_shutdown(
+                                    stream_id,
+                                    quiche::Shutdown::Write,
+                                    error_code,
+                                )
+                                .unwrap();
+                                continue;
+                            },
+                        };
+
+                    debug!(
+                        "Prioritizing request on stream {} as {:?}",
+                        stream_id, priority
+                    );
 
                     match self.h3_conn.send_response_with_priority(
                         conn, stream_id, &headers, &priority, false,
@@ -1374,6 +1566,17 @@ impl HttpConn for Http3Conn {
                     }
                 },
 
+                Ok((
+                    prioritized_element_id,
+                    quiche::h3::Event::PriorityUpdate,
+                )) => {
+                    info!(
+                        "{} PRIORITY_UPDATE triggered for element ID={}",
+                        conn.trace_id(),
+                        prioritized_element_id
+                    );
+                },
+
                 Ok((goaway_id, quiche::h3::Event::GoAway)) => {
                     trace!(
                         "{} got GOAWAY with ID {} ",
@@ -1429,7 +1632,7 @@ impl HttpConn for Http3Conn {
     }
 
     fn handle_writable(
-        &mut self, conn: &mut std::pin::Pin<Box<quiche::Connection>>,
+        &mut self, conn: &mut quiche::Connection,
         partial_responses: &mut HashMap<u64, PartialResponse>, stream_id: u64,
     ) {
         debug!("{} stream {} is writable", conn.trace_id(), stream_id);

@@ -24,6 +24,8 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use quiche::h3::NameValue;
+
 use ring::rand::*;
 
 use crate::Http3TestError;
@@ -57,7 +59,7 @@ pub fn run(
     let mut reqs_complete = 0;
 
     // Setup the event loop.
-    let poll = mio::Poll::new().unwrap();
+    let mut poll = mio::Poll::new().unwrap();
     let mut events = mio::Events::with_capacity(1024);
 
     info!("connecting to {:}", peer_addr);
@@ -72,16 +74,11 @@ pub fn run(
 
     // Create the UDP socket backing the QUIC connection, and register it with
     // the event loop.
-    let socket = std::net::UdpSocket::bind(bind_addr).unwrap();
-
-    let socket = mio::net::UdpSocket::from_socket(socket).unwrap();
-    poll.register(
-        &socket,
-        mio::Token(0),
-        mio::Ready::readable(),
-        mio::PollOpt::edge(),
-    )
-    .unwrap();
+    let mut socket =
+        mio::net::UdpSocket::bind(bind_addr.parse().unwrap()).unwrap();
+    poll.registry()
+        .register(&mut socket, mio::Token(0), mio::Interest::READABLE)
+        .unwrap();
 
     // Create the configuration for the QUIC connection.
     let mut config = quiche::Config::new(version).unwrap();
@@ -133,7 +130,7 @@ pub fn run(
 
     let (write, send_info) = conn.send(&mut out).expect("initial send failed");
 
-    while let Err(e) = socket.send_to(&out[..write], &send_info.to) {
+    while let Err(e) = socket.send_to(&out[..write], send_info.to) {
         if e.kind() == std::io::ErrorKind::WouldBlock {
             debug!("send() would block");
             continue;
@@ -265,14 +262,15 @@ pub fn run(
                     Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
                         info!(
                             "got response headers {:?} on stream id {}",
-                            &list, stream_id
+                            hdrs_to_strings(&list),
+                            stream_id
                         );
 
                         test.add_response_headers(stream_id, &list);
                     },
 
                     Ok((stream_id, quiche::h3::Event::Data)) => {
-                        if let Ok(read) =
+                        while let Ok(read) =
                             http3_conn.recv_body(&mut conn, stream_id, &mut buf)
                         {
                             info!(
@@ -329,13 +327,41 @@ pub fn run(
                         }
                     },
 
-                    Ok((_stream_id, quiche::h3::Event::Reset(e))) => {
-                        error!("request was reset by peer with {}", e);
+                    Ok((stream_id, quiche::h3::Event::Reset(e))) => {
+                        reqs_complete += 1;
 
-                        break;
+                        info!("request was reset by peer with {}", e);
+                        test.set_reset_stream_error(stream_id, e);
+
+                        if reqs_complete == reqs_count {
+                            info!(
+                                "Completed test run. {}/{} response(s) received in {:?}, closing...",
+                                reqs_complete,
+                                reqs_count,
+                                req_start.elapsed()
+                            );
+
+                            match conn.close(true, 0x00, b"kthxbye") {
+                                // Already closed.
+                                Ok(_) | Err(quiche::Error::Done) => (),
+
+                                Err(e) => {
+                                    return Err(Http3TestError::Other(format!(
+                                        "error closing conn: {:?}",
+                                        e
+                                    )));
+                                },
+                            }
+
+                            test.assert();
+
+                            break;
+                        }
                     },
 
                     Ok((_flow_id, quiche::h3::Event::Datagram)) => (),
+
+                    Ok((_, quiche::h3::Event::PriorityUpdate)) => (),
 
                     Ok((_goaway_id, quiche::h3::Event::GoAway)) => (),
 
@@ -370,7 +396,7 @@ pub fn run(
                 },
             };
 
-            if let Err(e) = socket.send_to(&out[..write], &send_info.to) {
+            if let Err(e) = socket.send_to(&out[..write], send_info.to) {
                 if e.kind() == std::io::ErrorKind::WouldBlock {
                     debug!("send() would block");
                     break;
@@ -405,4 +431,15 @@ pub fn run(
     }
 
     Ok(())
+}
+
+fn hdrs_to_strings(hdrs: &[quiche::h3::Header]) -> Vec<(String, String)> {
+    hdrs.iter()
+        .map(|h| {
+            (
+                String::from_utf8(h.name().into()).unwrap(),
+                String::from_utf8(h.value().into()).unwrap(),
+            )
+        })
+        .collect()
 }

@@ -47,7 +47,7 @@ use crate::recovery::Recovery;
 pub static CUBIC: CongestionControlOps = CongestionControlOps {
     on_init,
     on_packet_sent,
-    on_packet_acked,
+    on_packets_acked,
     congestion_event,
     collapse_cwnd,
     checkpoint,
@@ -191,6 +191,14 @@ fn on_packet_sent(r: &mut Recovery, sent_bytes: usize, now: Instant) {
     reno::on_packet_sent(r, sent_bytes, now);
 }
 
+fn on_packets_acked(
+    r: &mut Recovery, packets: &[Acked], epoch: packet::Epoch, now: Instant,
+) {
+    for pkt in packets {
+        on_packet_acked(r, pkt, epoch, now);
+    }
+}
+
 fn on_packet_acked(
     r: &mut Recovery, packet: &Acked, epoch: packet::Epoch, now: Instant,
 ) {
@@ -251,14 +259,7 @@ fn on_packet_acked(
             r.bytes_acked_sl -= r.max_datagram_size;
         }
 
-        if r.hystart.on_packet_acked(
-            epoch,
-            packet,
-            r.latest_rtt,
-            r.congestion_window,
-            now,
-            r.max_datagram_size,
-        ) {
+        if r.hystart.on_packet_acked(epoch, packet, r.latest_rtt, now) {
             // Exit to congestion avoidance if CSS ends.
             r.ssthresh = r.congestion_window;
         }
@@ -296,7 +297,7 @@ fn on_packet_acked(
             }
         }
 
-        let t = now - ca_start_time;
+        let t = now.saturating_duration_since(ca_start_time);
 
         // target = w_cubic(t + rtt)
         let target = r.cubic_state.w_cubic(t + r.min_rtt, r.max_datagram_size);
@@ -341,7 +342,8 @@ fn on_packet_acked(
 }
 
 fn congestion_event(
-    r: &mut Recovery, time_sent: Instant, epoch: packet::Epoch, now: Instant,
+    r: &mut Recovery, _lost_bytes: usize, time_sent: Instant,
+    epoch: packet::Epoch, now: Instant,
 ) {
     let in_congestion_recovery = r.in_congestion_recovery(time_sent);
 
@@ -473,7 +475,7 @@ mod tests {
             in_flight: true,
             delivered: 0,
             delivered_time: now,
-            recent_delivered_packet_sent_time: now,
+            first_sent_time: now,
             is_app_limited: false,
             has_data: false,
         };
@@ -489,6 +491,11 @@ mod tests {
             pkt_num: p.pkt_num,
             time_sent: p.time_sent,
             size: p.size,
+            delivered: 0,
+            delivered_time: now,
+            first_sent_time: now,
+            is_app_limited: false,
+            rtt: Duration::ZERO,
         }];
 
         r.on_packets_acked(acked, packet::EPOCH_APPLICATION, now);
@@ -516,7 +523,7 @@ mod tests {
             in_flight: true,
             delivered: 0,
             delivered_time: now,
-            recent_delivered_packet_sent_time: now,
+            first_sent_time: now,
             is_app_limited: false,
             has_data: false,
         };
@@ -533,16 +540,31 @@ mod tests {
                 pkt_num: p.pkt_num,
                 time_sent: p.time_sent,
                 size: p.size,
+                delivered: 0,
+                delivered_time: now,
+                first_sent_time: now,
+                is_app_limited: false,
+                rtt: Duration::ZERO,
             },
             Acked {
                 pkt_num: p.pkt_num,
                 time_sent: p.time_sent,
                 size: p.size,
+                delivered: 0,
+                delivered_time: now,
+                first_sent_time: now,
+                is_app_limited: false,
+                rtt: Duration::ZERO,
             },
             Acked {
                 pkt_num: p.pkt_num,
                 time_sent: p.time_sent,
                 size: p.size,
+                delivered: 0,
+                delivered_time: now,
+                first_sent_time: now,
+                is_app_limited: false,
+                rtt: Duration::ZERO,
             },
         ];
 
@@ -561,7 +583,12 @@ mod tests {
         let now = Instant::now();
         let prev_cwnd = r.cwnd();
 
-        r.congestion_event(now, packet::EPOCH_APPLICATION, now);
+        r.congestion_event(
+            r.max_datagram_size,
+            now,
+            packet::EPOCH_APPLICATION,
+            now,
+        );
 
         // In CUBIC, after congestion event, cwnd will be reduced by (1 -
         // CUBIC_BETA)
@@ -583,7 +610,12 @@ mod tests {
         }
 
         // Trigger congestion event to update ssthresh
-        r.congestion_event(now, packet::EPOCH_APPLICATION, now);
+        r.congestion_event(
+            r.max_datagram_size,
+            now,
+            packet::EPOCH_APPLICATION,
+            now,
+        );
 
         // After congestion event, cwnd will be reduced.
         let cur_cwnd = (prev_cwnd as f64 * BETA_CUBIC) as usize;
@@ -607,6 +639,11 @@ mod tests {
                 pkt_num: 0,
                 time_sent: now,
                 size: r.max_datagram_size,
+                delivered: 0,
+                delivered_time: now,
+                first_sent_time: now,
+                is_app_limited: false,
+                rtt: Duration::ZERO,
             }];
 
             r.on_packets_acked(acked, packet::EPOCH_APPLICATION, now);
@@ -628,7 +665,12 @@ mod tests {
         r.on_packet_sent_cc(30000, now);
 
         // Trigger congestion event to update ssthresh
-        r.congestion_event(now, packet::EPOCH_APPLICATION, now);
+        r.congestion_event(
+            r.max_datagram_size,
+            now,
+            packet::EPOCH_APPLICATION,
+            now,
+        );
 
         // After persistent congestion, cwnd should be the minimum window
         r.collapse_cwnd();
@@ -642,6 +684,11 @@ mod tests {
             // To exit from recovery
             time_sent: now + Duration::from_millis(1),
             size: r.max_datagram_size,
+            delivered: 0,
+            delivered_time: now,
+            first_sent_time: now,
+            is_app_limited: false,
+            rtt: Duration::ZERO,
         }];
 
         r.on_packets_acked(acked, packet::EPOCH_APPLICATION, now);
@@ -674,7 +721,7 @@ mod tests {
             in_flight: true,
             delivered: 0,
             delivered_time: now,
-            recent_delivered_packet_sent_time: now,
+            first_sent_time: now,
             is_app_limited: false,
             has_data: false,
         };
@@ -703,6 +750,11 @@ mod tests {
                 pkt_num: ack_pn,
                 time_sent: p.time_sent,
                 size: p.size,
+                delivered: 0,
+                delivered_time: now,
+                first_sent_time: now,
+                is_app_limited: false,
+                rtt: Duration::ZERO,
             }];
 
             r.on_packets_acked(acked, epoch, now);
@@ -735,6 +787,11 @@ mod tests {
                 pkt_num: ack_pn,
                 time_sent: p.time_sent,
                 size: p.size,
+                delivered: 0,
+                delivered_time: now,
+                first_sent_time: now,
+                is_app_limited: false,
+                rtt: Duration::ZERO,
             }];
 
             r.on_packets_acked(acked, epoch, now);
@@ -770,6 +827,11 @@ mod tests {
                 pkt_num: ack_pn,
                 time_sent: p.time_sent,
                 size: p.size,
+                delivered: 0,
+                delivered_time: now,
+                first_sent_time: now,
+                is_app_limited: false,
+                rtt: Duration::ZERO,
             }];
 
             r.on_packets_acked(acked, epoch, now);
@@ -807,7 +869,7 @@ mod tests {
             in_flight: true,
             delivered: 0,
             delivered_time: now,
-            recent_delivered_packet_sent_time: now,
+            first_sent_time: now,
             is_app_limited: false,
             has_data: false,
         };
@@ -836,6 +898,11 @@ mod tests {
                 pkt_num: ack_pn,
                 time_sent: p.time_sent,
                 size: p.size,
+                delivered: 0,
+                delivered_time: now,
+                first_sent_time: now,
+                is_app_limited: false,
+                rtt: Duration::ZERO,
             }];
 
             r.on_packets_acked(acked, epoch, now);
@@ -868,6 +935,11 @@ mod tests {
                 pkt_num: ack_pn,
                 time_sent: p.time_sent,
                 size: p.size,
+                delivered: 0,
+                delivered_time: now,
+                first_sent_time: now,
+                is_app_limited: false,
+                rtt: Duration::ZERO,
             }];
 
             r.on_packets_acked(acked, epoch, now);
@@ -901,6 +973,11 @@ mod tests {
                     pkt_num: ack_pn,
                     time_sent: p.time_sent,
                     size: p.size,
+                    delivered: 0,
+                    delivered_time: now,
+                    first_sent_time: now,
+                    is_app_limited: false,
+                    rtt: Duration::ZERO,
                 }];
 
                 r.on_packets_acked(acked, epoch, now);
@@ -927,7 +1004,12 @@ mod tests {
         }
 
         // Trigger congestion event to update ssthresh
-        r.congestion_event(now, packet::EPOCH_APPLICATION, now);
+        r.congestion_event(
+            r.max_datagram_size,
+            now,
+            packet::EPOCH_APPLICATION,
+            now,
+        );
 
         // After congestion event, cwnd will be reduced.
         let cur_cwnd = (prev_cwnd as f64 * BETA_CUBIC) as usize;
@@ -940,6 +1022,11 @@ mod tests {
             // To exit from recovery
             time_sent: now + rtt,
             size: r.max_datagram_size,
+            delivered: 0,
+            delivered_time: now,
+            first_sent_time: now,
+            is_app_limited: false,
+            rtt: Duration::ZERO,
         }];
 
         // Ack more than cwnd bytes with rtt=100ms
@@ -959,7 +1046,12 @@ mod tests {
 
         // Trigger another congestion event.
         let prev_cwnd = r.cwnd();
-        r.congestion_event(now, packet::EPOCH_APPLICATION, now);
+        r.congestion_event(
+            r.max_datagram_size,
+            now,
+            packet::EPOCH_APPLICATION,
+            now,
+        );
 
         // After congestion event, cwnd will be reduced.
         let cur_cwnd = (cur_cwnd as f64 * BETA_CUBIC) as usize;
@@ -972,6 +1064,11 @@ mod tests {
             // To exit from recovery
             time_sent: now + rtt,
             size: r.max_datagram_size,
+            delivered: 0,
+            delivered_time: now,
+            first_sent_time: now,
+            is_app_limited: false,
+            rtt: Duration::ZERO,
         }];
 
         // Ack more than cwnd bytes with rtt=100ms.
@@ -1003,7 +1100,12 @@ mod tests {
         }
 
         // Trigger congestion event to update ssthresh
-        r.congestion_event(now, packet::EPOCH_APPLICATION, now);
+        r.congestion_event(
+            r.max_datagram_size,
+            now,
+            packet::EPOCH_APPLICATION,
+            now,
+        );
 
         // After 1st congestion event, cwnd will be reduced.
         let cur_cwnd = (prev_cwnd as f64 * BETA_CUBIC) as usize;
@@ -1026,6 +1128,11 @@ mod tests {
                 pkt_num: 0,
                 time_sent: now,
                 size: r.max_datagram_size,
+                delivered: 0,
+                delivered_time: now,
+                first_sent_time: now,
+                is_app_limited: false,
+                rtt: Duration::ZERO,
             }];
 
             r.on_packets_acked(acked, packet::EPOCH_APPLICATION, now);
@@ -1039,7 +1146,12 @@ mod tests {
         // Fast convergence: now there is 2nd congestion event and
         // cwnd is not fully recovered to w_max, w_max will be
         // further reduced.
-        r.congestion_event(now, packet::EPOCH_APPLICATION, now);
+        r.congestion_event(
+            r.max_datagram_size,
+            now,
+            packet::EPOCH_APPLICATION,
+            now,
+        );
 
         // After 2nd congestion event, cwnd will be reduced.
         let cur_cwnd = (prev_cwnd as f64 * BETA_CUBIC) as usize;

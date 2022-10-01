@@ -71,8 +71,6 @@ const LOSS_REDUCTION_FACTOR: f64 = 0.5;
 
 const PACING_MULTIPLIER: f64 = 1.25;
 
-const MICROS_PER_SEC: u64 = 1_000_000;
-
 pub struct Recovery {
     loss_detection_timer: Option<Instant>,
 
@@ -149,13 +147,17 @@ pub struct Recovery {
     // Pacing.
     pacing_rate: u64,
 
-    last_packet_scheduled_time: Option<Instant>,
+    last_packet_scheduled_time: Instant,
 
     // RFC6937 PRR.
     prr: prr::PRR,
 
     #[cfg(feature = "qlog")]
     qlog_metrics: QlogMetrics,
+
+    // The maximum size of a data aggregate scheduled and
+    // transmitted together.
+    send_quantum: usize,
 }
 
 impl Recovery {
@@ -237,9 +239,12 @@ impl Recovery {
 
             pacing_rate: 0,
 
-            last_packet_scheduled_time: None,
+            last_packet_scheduled_time: Instant::now(),
 
             prr: prr::PRR::default(),
+
+            send_quantum: config.max_send_udp_payload_size *
+                INITIAL_WINDOW_PACKETS,
 
             #[cfg(feature = "qlog")]
             qlog_metrics: QlogMetrics::default(),
@@ -259,12 +264,11 @@ impl Recovery {
         let sent_bytes = pkt.size;
         let pkt_num = pkt.pkt_num;
 
-        self.delivery_rate.on_packet_sent(&mut pkt, now);
-
         self.largest_sent_pkt[epoch] =
             cmp::max(self.largest_sent_pkt[epoch], pkt_num);
 
-        self.sent[epoch].push_back(pkt);
+        self.delivery_rate
+            .on_packet_sent(&mut pkt, self.bytes_in_flight, now);
 
         if in_flight {
             if ack_eliciting {
@@ -273,8 +277,9 @@ impl Recovery {
 
             self.in_flight_count[epoch] += 1;
 
-            self.app_limited =
-                (self.bytes_in_flight + sent_bytes) < self.congestion_window;
+            self.update_app_limited(
+                (self.bytes_in_flight + sent_bytes) < self.congestion_window,
+            );
 
             self.on_packet_sent_cc(sent_bytes, now);
 
@@ -294,15 +299,17 @@ impl Recovery {
         // Pacing: Set the pacing rate if CC doesn't do its own.
         if !(self.cc_ops.has_custom_pacing)() {
             if let Some(srtt) = self.smoothed_rtt {
-                let cwnd = self.congestion_window as u64;
-                let rate =
-                    (cwnd * MICROS_PER_SEC) as f64 / srtt.as_micros() as f64;
-                let rate = (rate * PACING_MULTIPLIER) as u64;
-                self.set_pacing_rate(rate);
+                let rate = PACING_MULTIPLIER * self.congestion_window as f64 /
+                    srtt.as_secs_f64();
+                self.set_pacing_rate(rate as u64);
             }
         }
 
         self.schedule_next_packet(epoch, now, sent_bytes);
+
+        pkt.time_sent = self.get_packet_send_time();
+
+        self.sent[epoch].push_back(pkt);
 
         self.bytes_sent += sent_bytes;
         trace!("{} {:?}", trace_id, self);
@@ -318,7 +325,7 @@ impl Recovery {
         }
     }
 
-    pub fn get_packet_send_time(&self) -> Option<Instant> {
+    pub fn get_packet_send_time(&self) -> Instant {
         self.last_packet_scheduled_time
     }
 
@@ -334,21 +341,17 @@ impl Recovery {
             self.bytes_sent <= self.congestion_window ||
             self.pacing_rate == 0
         {
-            self.last_packet_scheduled_time = Some(now);
+            self.last_packet_scheduled_time =
+                cmp::max(self.last_packet_scheduled_time, now);
+
             return;
         }
 
-        self.last_packet_scheduled_time = match self.last_packet_scheduled_time {
-            Some(last_scheduled_time) => {
-                let interval: u64 =
-                    (packet_size as u64 * MICROS_PER_SEC) / self.pacing_rate;
-                let interval = Duration::from_micros(interval);
-                let next_schedule_time = last_scheduled_time + interval;
-                Some(cmp::max(now, next_schedule_time))
-            },
+        let interval = packet_size as f64 / self.pacing_rate as f64;
+        let interval = Duration::from_secs_f64(interval);
+        let next_schedule_time = self.last_packet_scheduled_time + interval;
 
-            None => Some(now),
-        };
+        self.last_packet_scheduled_time = cmp::max(now, next_schedule_time);
     }
 
     pub fn on_ack_received(
@@ -416,7 +419,12 @@ impl Recovery {
 
                     // Calculate new time reordering threshold.
                     let loss_delay = max_rtt.mul_f64(self.time_thresh);
-                    if now.duration_since(unacked.time_sent) > loss_delay {
+
+                    // unacked.time_sent can be in the future due to
+                    // pacing.
+                    if now.saturating_duration_since(unacked.time_sent) >
+                        loss_delay
+                    {
                         // TODO: do time threshold update
                         self.time_thresh = 5_f64 / 4_f64;
                     }
@@ -441,8 +449,6 @@ impl Recovery {
                 if unacked.in_flight {
                     self.in_flight_count[epoch] =
                         self.in_flight_count[epoch].saturating_sub(1);
-
-                    self.delivery_rate.on_packet_acked(unacked, now);
                 }
 
                 newly_acked.push(Acked {
@@ -451,6 +457,16 @@ impl Recovery {
                     time_sent: unacked.time_sent,
 
                     size: unacked.size,
+
+                    rtt: now.saturating_duration_since(unacked.time_sent),
+
+                    delivered: unacked.delivered,
+
+                    delivered_time: unacked.delivered_time,
+
+                    first_sent_time: unacked.first_sent_time,
+
+                    is_app_limited: unacked.is_app_limited,
                 });
 
                 trace!("{} packet newly acked {}", trace_id, unacked.pkt_num);
@@ -462,14 +478,15 @@ impl Recovery {
             (self.cc_ops.rollback)(self);
         }
 
-        self.delivery_rate.estimate();
-
         if newly_acked.is_empty() {
             return Ok(());
         }
 
         if largest_newly_acked_pkt_num == largest_acked && has_ack_eliciting {
-            let latest_rtt = now - largest_newly_acked_sent_time;
+            // The packet's sent time could be in the future if pacing is used
+            // and the network has a very short RTT.
+            let latest_rtt =
+                now.saturating_duration_since(largest_newly_acked_sent_time);
 
             let ack_delay = if epoch == packet::EPOCH_APPLICATION {
                 Duration::from_micros(ack_delay)
@@ -611,7 +628,7 @@ impl Recovery {
     }
 
     pub fn delivery_rate(&self) -> u64 {
-        self.delivery_rate.delivery_rate()
+        self.delivery_rate.sample_delivery_rate()
     }
 
     pub fn max_datagram_size(&self) -> usize {
@@ -863,9 +880,16 @@ impl Recovery {
     fn on_packets_acked(
         &mut self, acked: Vec<Acked>, epoch: packet::Epoch, now: Instant,
     ) {
-        for pkt in acked {
-            (self.cc_ops.on_packet_acked)(self, &pkt, epoch, now);
+        // Update delivery rate sample per acked packet.
+        for pkt in &acked {
+            self.delivery_rate.update_rate_sample(pkt, now);
         }
+
+        // Fill in a rate sample.
+        self.delivery_rate.generate_rate_sample(self.min_rtt);
+
+        // Call congestion control hooks.
+        (self.cc_ops.on_packets_acked)(self, &acked, epoch, now);
     }
 
     fn in_congestion_recovery(&self, sent_time: Instant) -> bool {
@@ -890,7 +914,7 @@ impl Recovery {
     ) {
         self.bytes_in_flight = self.bytes_in_flight.saturating_sub(lost_bytes);
 
-        self.congestion_event(largest_lost_pkt.time_sent, epoch, now);
+        self.congestion_event(lost_bytes, largest_lost_pkt.time_sent, epoch, now);
 
         if self.in_persistent_congestion(largest_lost_pkt.pkt_num) {
             self.collapse_cwnd();
@@ -898,23 +922,18 @@ impl Recovery {
     }
 
     fn congestion_event(
-        &mut self, time_sent: Instant, epoch: packet::Epoch, now: Instant,
+        &mut self, lost_bytes: usize, time_sent: Instant, epoch: packet::Epoch,
+        now: Instant,
     ) {
         if !self.in_congestion_recovery(time_sent) {
             (self.cc_ops.checkpoint)(self);
         }
 
-        (self.cc_ops.congestion_event)(self, time_sent, epoch, now);
+        (self.cc_ops.congestion_event)(self, lost_bytes, time_sent, epoch, now);
     }
 
     fn collapse_cwnd(&mut self) {
         (self.cc_ops.collapse_cwnd)(self);
-    }
-
-    pub fn rate_check_app_limited(&mut self) {
-        if self.app_limited {
-            self.delivery_rate.check_app_limited(self.bytes_in_flight)
-        }
     }
 
     pub fn update_app_limited(&mut self, v: bool) {
@@ -923,6 +942,10 @@ impl Recovery {
 
     pub fn app_limited(&mut self) -> bool {
         self.app_limited
+    }
+
+    pub fn delivery_rate_update_app_limited(&mut self, v: bool) {
+        self.delivery_rate.update_app_limited(v);
     }
 
     #[cfg(feature = "qlog")]
@@ -938,6 +961,10 @@ impl Recovery {
         };
 
         self.qlog_metrics.maybe_update(qlog_metrics)
+    }
+
+    pub fn send_quantum(&self) -> usize {
+        self.send_quantum
     }
 }
 
@@ -975,11 +1002,16 @@ pub struct CongestionControlOps {
 
     pub on_packet_sent: fn(r: &mut Recovery, sent_bytes: usize, now: Instant),
 
-    pub on_packet_acked:
-        fn(r: &mut Recovery, packet: &Acked, epoch: packet::Epoch, now: Instant),
+    pub on_packets_acked: fn(
+        r: &mut Recovery,
+        packets: &[Acked],
+        epoch: packet::Epoch,
+        now: Instant,
+    ),
 
     pub congestion_event: fn(
         r: &mut Recovery,
+        lost_bytes: usize,
         time_sent: Instant,
         epoch: packet::Epoch,
         now: Instant,
@@ -1081,7 +1113,7 @@ pub struct Sent {
 
     pub delivered_time: Instant,
 
-    pub recent_delivered_packet_sent_time: Instant,
+    pub first_sent_time: Instant,
 
     pub is_app_limited: bool,
 
@@ -1095,11 +1127,7 @@ impl std::fmt::Debug for Sent {
         write!(f, "pkt_size={:?} ", self.size)?;
         write!(f, "delivered={:?} ", self.delivered)?;
         write!(f, "delivered_time={:?} ", self.delivered_time.elapsed())?;
-        write!(
-            f,
-            "recent_delivered_packet_sent_time={:?} ",
-            self.recent_delivered_packet_sent_time.elapsed()
-        )?;
+        write!(f, "first_sent_time={:?} ", self.first_sent_time.elapsed())?;
         write!(f, "is_app_limited={} ", self.is_app_limited)?;
         write!(f, "has_data={} ", self.has_data)?;
 
@@ -1114,6 +1142,16 @@ pub struct Acked {
     pub time_sent: Instant,
 
     pub size: usize,
+
+    pub rtt: Duration,
+
+    pub delivered: usize,
+
+    pub delivered_time: Instant,
+
+    pub first_sent_time: Instant,
+
+    pub is_app_limited: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1304,7 +1342,7 @@ mod tests {
             in_flight: true,
             delivered: 0,
             delivered_time: now,
-            recent_delivered_packet_sent_time: now,
+            first_sent_time: now,
             is_app_limited: false,
             has_data: false,
         };
@@ -1330,7 +1368,7 @@ mod tests {
             in_flight: true,
             delivered: 0,
             delivered_time: now,
-            recent_delivered_packet_sent_time: now,
+            first_sent_time: now,
             is_app_limited: false,
             has_data: false,
         };
@@ -1356,7 +1394,7 @@ mod tests {
             in_flight: true,
             delivered: 0,
             delivered_time: now,
-            recent_delivered_packet_sent_time: now,
+            first_sent_time: now,
             is_app_limited: false,
             has_data: false,
         };
@@ -1382,7 +1420,7 @@ mod tests {
             in_flight: true,
             delivered: 0,
             delivered_time: now,
-            recent_delivered_packet_sent_time: now,
+            first_sent_time: now,
             is_app_limited: false,
             has_data: false,
         };
@@ -1440,7 +1478,7 @@ mod tests {
             in_flight: true,
             delivered: 0,
             delivered_time: now,
-            recent_delivered_packet_sent_time: now,
+            first_sent_time: now,
             is_app_limited: false,
             has_data: false,
         };
@@ -1466,7 +1504,7 @@ mod tests {
             in_flight: true,
             delivered: 0,
             delivered_time: now,
-            recent_delivered_packet_sent_time: now,
+            first_sent_time: now,
             is_app_limited: false,
             has_data: false,
         };
@@ -1537,7 +1575,7 @@ mod tests {
             in_flight: true,
             delivered: 0,
             delivered_time: now,
-            recent_delivered_packet_sent_time: now,
+            first_sent_time: now,
             is_app_limited: false,
             has_data: false,
         };
@@ -1563,7 +1601,7 @@ mod tests {
             in_flight: true,
             delivered: 0,
             delivered_time: now,
-            recent_delivered_packet_sent_time: now,
+            first_sent_time: now,
             is_app_limited: false,
             has_data: false,
         };
@@ -1589,7 +1627,7 @@ mod tests {
             in_flight: true,
             delivered: 0,
             delivered_time: now,
-            recent_delivered_packet_sent_time: now,
+            first_sent_time: now,
             is_app_limited: false,
             has_data: false,
         };
@@ -1615,7 +1653,7 @@ mod tests {
             in_flight: true,
             delivered: 0,
             delivered_time: now,
-            recent_delivered_packet_sent_time: now,
+            first_sent_time: now,
             is_app_limited: false,
             has_data: false,
         };
@@ -1697,7 +1735,7 @@ mod tests {
             in_flight: true,
             delivered: 0,
             delivered_time: now,
-            recent_delivered_packet_sent_time: now,
+            first_sent_time: now,
             is_app_limited: false,
             has_data: false,
         };
@@ -1723,7 +1761,7 @@ mod tests {
             in_flight: true,
             delivered: 0,
             delivered_time: now,
-            recent_delivered_packet_sent_time: now,
+            first_sent_time: now,
             is_app_limited: false,
             has_data: false,
         };
@@ -1749,7 +1787,7 @@ mod tests {
             in_flight: true,
             delivered: 0,
             delivered_time: now,
-            recent_delivered_packet_sent_time: now,
+            first_sent_time: now,
             is_app_limited: false,
             has_data: false,
         };
@@ -1775,7 +1813,7 @@ mod tests {
             in_flight: true,
             delivered: 0,
             delivered_time: now,
-            recent_delivered_packet_sent_time: now,
+            first_sent_time: now,
             is_app_limited: false,
             has_data: false,
         };
@@ -1869,7 +1907,7 @@ mod tests {
             in_flight: true,
             delivered: 0,
             delivered_time: now,
-            recent_delivered_packet_sent_time: now,
+            first_sent_time: now,
             is_app_limited: false,
             has_data: false,
         };
@@ -1887,7 +1925,7 @@ mod tests {
 
         // First packet will be sent out immidiately.
         assert_eq!(r.pacing_rate, 0);
-        assert_eq!(r.get_packet_send_time().unwrap(), now);
+        assert_eq!(r.get_packet_send_time(), now);
 
         // Wait 50ms for ACK.
         now += Duration::from_millis(50);
@@ -1923,7 +1961,7 @@ mod tests {
             in_flight: true,
             delivered: 0,
             delivered_time: now,
-            recent_delivered_packet_sent_time: now,
+            first_sent_time: now,
             is_app_limited: false,
             has_data: false,
         };
@@ -1940,7 +1978,7 @@ mod tests {
         assert_eq!(r.bytes_in_flight, 6500);
 
         // Pacing is not done during intial phase of connection.
-        assert_eq!(r.get_packet_send_time().unwrap(), now);
+        assert_eq!(r.get_packet_send_time(), now);
 
         // Send the third packet out.
         let p = Sent {
@@ -1954,7 +1992,7 @@ mod tests {
             in_flight: true,
             delivered: 0,
             delivered_time: now,
-            recent_delivered_packet_sent_time: now,
+            first_sent_time: now,
             is_app_limited: false,
             has_data: false,
         };
@@ -1973,12 +2011,11 @@ mod tests {
 
         // We pace this outgoing packet. as all conditions for pacing
         // are passed.
-        assert_eq!(r.pacing_rate, (12000.0 * PACING_MULTIPLIER / 0.05) as u64);
+        let pacing_rate = (12000.0 * PACING_MULTIPLIER / 0.05) as u64;
+        assert_eq!(r.pacing_rate, pacing_rate);
         assert_eq!(
-            r.get_packet_send_time().unwrap(),
-            now + Duration::from_micros(
-                (6500 * 1000000) / (12000.0 * PACING_MULTIPLIER / 0.05) as u64
-            )
+            r.get_packet_send_time(),
+            now + Duration::from_secs_f64(6500.0 / pacing_rate as f64)
         );
     }
 }

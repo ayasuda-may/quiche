@@ -417,7 +417,7 @@ pub extern fn quiche_accept(
     let from = std_addr_from_c(from, from_len);
 
     match accept(&scid, odcid.as_ref(), from, config) {
-        Ok(c) => Box::into_raw(Pin::into_inner(c)),
+        Ok(c) => Box::into_raw(Box::new(c)),
 
         Err(_) => ptr::null_mut(),
     }
@@ -440,7 +440,7 @@ pub extern fn quiche_connect(
     let to = std_addr_from_c(to, to_len);
 
     match connect(server_name, &scid, to, config) {
-        Ok(c) => Box::into_raw(Pin::into_inner(c)),
+        Ok(c) => Box::into_raw(Box::new(c)),
 
         Err(_) => ptr::null_mut(),
     }
@@ -525,7 +525,7 @@ pub extern fn quiche_conn_new_with_tls(
         tls,
         is_server,
     ) {
-        Ok(c) => Box::into_raw(Pin::into_inner(c)),
+        Ok(c) => Box::into_raw(Box::new(c)),
 
         Err(_) => ptr::null_mut(),
     }
@@ -1175,6 +1175,11 @@ pub extern fn quiche_conn_peer_streams_left_bidi(conn: &mut Connection) -> u64 {
 #[no_mangle]
 pub extern fn quiche_conn_peer_streams_left_uni(conn: &mut Connection) -> u64 {
     conn.peer_streams_left_uni()
+}
+
+#[no_mangle]
+pub extern fn quiche_conn_send_quantum(conn: &mut Connection) -> size_t {
+    conn.send_quantum() as size_t
 }
 
 fn std_addr_from_c(addr: &sockaddr, addr_len: socklen_t) -> SocketAddr {

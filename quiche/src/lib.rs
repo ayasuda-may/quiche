@@ -196,6 +196,25 @@
 //! # Ok::<(), quiche::Error>(())
 //! ```
 //!
+//! ### Pacing
+//!
+//! It is recommended that applications [pace] sending of outgoing packets to
+//! avoid creating packet bursts that could cause short-term congestion and
+//! losses in the network.
+//!
+//! quiche exposes pacing hints for outgoing packets through the [`at`] field
+//! of the [`SendInfo`] structure that is returned by the [`send()`] method.
+//! This field represents the time when a specific packet should be sent into
+//! the network.
+//!
+//! Applications can use these hints by artificially delaying the sending of
+//! packets through platform-specific mechanisms (such as the [`SO_TXTIME`]
+//! socket option on Linux), or custom methods (for example by using user-space
+//! timers).
+//!
+//! [pace]: https://datatracker.ietf.org/doc/html/rfc9002#section-7.7
+//! [`SO_TXTIME`]: https://man7.org/linux/man-pages/man8/tc-etf.8.html
+//!
 //! ## Sending and receiving stream data
 //!
 //! After some back and forth, the connection will complete its handshake and
@@ -251,6 +270,7 @@
 //! [`RecvInfo`]: struct.RecvInfo.html
 //! [`send()`]: struct.Connection.html#method.send
 //! [`SendInfo`]: struct.SendInfo.html
+//! [`at`]: struct.SendInfo.html#structfield.at
 //! [`timeout()`]: struct.Connection.html#method.timeout
 //! [`on_timeout()`]: struct.Connection.html#method.on_timeout
 //! [`stream_send()`]: struct.Connection.html#method.stream_send
@@ -286,9 +306,31 @@
 //! or [`accept()`]. Otherwise the connection will use a default CC algorithm.
 //!
 //! [`CongestionControlAlgorithm`]: enum.CongestionControlAlgorithm.html
+//!
+//! ## Feature flags
+//!
+//! quiche defines a number of [feature flags] to reduce the amount of compiled
+//! code and dependencies:
+//!
+//! * `boringssl-vendored` (default): Build the vendored BoringSSL library.
+//!
+//! * `boringssl-boring-crate`: Use the BoringSSL library provided by the
+//!   [boring] crate. It takes precedence over `boringssl-vendored` if both
+//!   features are enabled.
+//!
+//! * `pkg-config-meta`: Generate pkg-config metadata file for libquiche.
+//!
+//! * `ffi`: Build and expose the FFI API.
+//!
+//! * `qlog`: Enable support for the [qlog] logging format.
+//!
+//! [feature flags]: https://doc.rust-lang.org/cargo/reference/manifest.html#the-features-section
+//! [boring]: https://crates.io/crates/boring
+//! [qlog]: https://datatracker.ietf.org/doc/html/draft-ietf-quic-qlog-main-schema
 
 #![allow(clippy::upper_case_acronyms)]
 #![warn(missing_docs)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 #[macro_use]
 extern crate log;
@@ -317,7 +359,6 @@ use std::time;
 
 use std::net::SocketAddr;
 
-use std::pin::Pin;
 use std::str::FromStr;
 
 use std::collections::VecDeque;
@@ -526,6 +567,10 @@ pub struct SendInfo {
     pub to: SocketAddr,
 
     /// The time to send the packet out.
+    ///
+    /// See [Pacing] for more details.
+    ///
+    /// [Pacing]: index.html#pacing
     pub at: time::Instant,
 }
 
@@ -559,6 +604,7 @@ pub enum Shutdown {
 /// Qlog logging level.
 #[repr(C)]
 #[cfg(feature = "qlog")]
+#[cfg_attr(docsrs, doc(cfg(feature = "qlog")))]
 pub enum QlogLevel {
     /// Logs any events of Core importance.
     Core  = 0,
@@ -610,11 +656,27 @@ impl Config {
     /// # Ok::<(), quiche::Error>(())
     /// ```
     pub fn new(version: u32) -> Result<Config> {
+        Self::with_tls_ctx(version, tls::Context::new()?)
+    }
+
+    /// Creates a config object with the given version and [`SslContext`].
+    ///
+    /// This is useful for applications that wish to manually configure
+    /// [`SslContext`].
+    ///
+    /// [`SslContext`]: https://docs.rs/boring/latest/boring/ssl/struct.SslContext.html
+    #[cfg(feature = "boringssl-boring-crate")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "boringssl-boring-crate")))]
+    pub fn with_boring_ssl_ctx(
+        version: u32, tls_ctx: boring::ssl::SslContext,
+    ) -> Result<Config> {
+        Self::with_tls_ctx(version, tls::Context::from_boring(tls_ctx))
+    }
+
+    fn with_tls_ctx(version: u32, tls_ctx: tls::Context) -> Result<Config> {
         if !is_reserved_version(version) && !version_is_supported(version) {
             return Err(Error::UnknownVersion);
         }
-
-        let tls_ctx = tls::Context::new()?;
 
         Ok(Config {
             local_transport_params: TransportParams::default(),
@@ -1040,6 +1102,9 @@ pub struct Connection {
     /// Peer's flow control limit for the connection.
     max_tx_data: u64,
 
+    /// Last tx_data before running a full send() loop.
+    last_tx_data: u64,
+
     /// Total number of bytes the server can send before the peer's address
     /// is verified.
     max_send_bytes: usize,
@@ -1180,7 +1245,7 @@ pub struct Connection {
 pub fn accept(
     scid: &ConnectionId, odcid: Option<&ConnectionId>, from: SocketAddr,
     config: &mut Config,
-) -> Result<Pin<Box<Connection>>> {
+) -> Result<Connection> {
     let conn = Connection::new(scid, odcid, from, config, true)?;
 
     Ok(conn)
@@ -1206,7 +1271,7 @@ pub fn accept(
 pub fn connect(
     server_name: Option<&str>, scid: &ConnectionId, to: SocketAddr,
     config: &mut Config,
-) -> Result<Pin<Box<Connection>>> {
+) -> Result<Connection> {
     let mut conn = Connection::new(scid, None, to, config, false)?;
 
     if let Some(server_name) = server_name {
@@ -1418,7 +1483,7 @@ impl Connection {
     fn new(
         scid: &ConnectionId, odcid: Option<&ConnectionId>, peer: SocketAddr,
         config: &mut Config, is_server: bool,
-    ) -> Result<Pin<Box<Connection>>> {
+    ) -> Result<Connection> {
         let tls = config.tls_ctx.new_handshake()?;
         Connection::with_tls(scid, odcid, peer, config, tls, is_server)
     }
@@ -1426,13 +1491,13 @@ impl Connection {
     fn with_tls(
         scid: &ConnectionId, odcid: Option<&ConnectionId>, peer: SocketAddr,
         config: &mut Config, tls: tls::Handshake, is_server: bool,
-    ) -> Result<Pin<Box<Connection>>> {
+    ) -> Result<Connection> {
         let max_rx_data = config.local_transport_params.initial_max_data;
 
         let scid_as_hex: Vec<String> =
             scid.iter().map(|b| format!("{:02x}", b)).collect();
 
-        let mut conn = Box::pin(Connection {
+        let mut conn = Connection {
             version: config.version,
 
             dcid: ConnectionId::default(),
@@ -1478,6 +1543,7 @@ impl Connection {
 
             tx_data: 0,
             max_tx_data: 0,
+            last_tx_data: 0,
 
             stream_retrans_bytes: 0,
 
@@ -1558,7 +1624,7 @@ impl Connection {
             ),
 
             emit_dgram: true,
-        });
+        };
 
         if let Some(odcid) = odcid {
             conn.local_transport_params
@@ -1573,8 +1639,7 @@ impl Connection {
         conn.local_transport_params.initial_source_connection_id =
             Some(scid.to_vec().into());
 
-        let conn_ptr = &conn as &Connection as *const Connection;
-        conn.handshake.init(conn_ptr, is_server)?;
+        conn.handshake.init(is_server)?;
 
         conn.handshake
             .use_legacy_codepoint(config.version != PROTOCOL_VERSION_V1);
@@ -1629,6 +1694,7 @@ impl Connection {
     ///
     /// [`Writer`]: https://doc.rust-lang.org/std/io/trait.Write.html
     #[cfg(feature = "qlog")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "qlog")))]
     pub fn set_qlog(
         &mut self, writer: Box<dyn std::io::Write + Send + Sync>, title: String,
         description: String,
@@ -1646,6 +1712,7 @@ impl Connection {
     ///
     /// [`Writer`]: https://doc.rust-lang.org/std/io/trait.Write.html
     #[cfg(feature = "qlog")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "qlog")))]
     pub fn set_qlog_with_level(
         &mut self, writer: Box<dyn std::io::Write + Send + Sync>, title: String,
         description: String, qlog_level: QlogLevel,
@@ -2143,37 +2210,8 @@ impl Connection {
             pn
         );
 
-        qlog_with_type!(QLOG_PACKET_RX, self.qlog, q, {
-            let packet_size = b.len();
-
-            let qlog_pkt_hdr = qlog::events::quic::PacketHeader::with_type(
-                hdr.ty.to_qlog(),
-                pn,
-                Some(hdr.version),
-                Some(&hdr.scid),
-                Some(&hdr.dcid),
-            );
-
-            let qlog_raw_info = RawInfo {
-                length: Some(packet_size as u64),
-                payload_length: Some(payload_len as u64),
-                data: None,
-            };
-
-            let ev_data =
-                EventData::PacketReceived(qlog::events::quic::PacketReceived {
-                    header: qlog_pkt_hdr,
-                    frames: Some(vec![]),
-                    is_coalesced: None,
-                    retry_token: None,
-                    stateless_reset_token: None,
-                    supported_versions: None,
-                    raw: Some(qlog_raw_info),
-                    datagram_id: None,
-                });
-
-            q.add_event_data_with_instant(ev_data, now).ok();
-        });
+        #[cfg(feature = "qlog")]
+        let mut qlog_frames = vec![];
 
         let mut payload = packet::decrypt_pkt(
             &mut b,
@@ -2230,12 +2268,15 @@ impl Connection {
         // ACK and PADDING.
         let mut ack_elicited = false;
 
-        // Process packet payload.
+        // Process packet payload. If a frame cannot be processed, store the
+        // error and stop further packet processing.
+        let mut frame_processing_err = None;
+
         while payload.cap() > 0 {
             let frame = frame::Frame::from_bytes(&mut payload, hdr.ty)?;
 
-            qlog_with_type!(QLOG_PACKET_RX, self.qlog, q, {
-                q.add_frame(frame.to_qlog(), false).ok();
+            qlog_with_type!(QLOG_PACKET_RX, self.qlog, _q, {
+                qlog_frames.push(frame.to_qlog());
             });
 
             if frame.ack_eliciting() {
@@ -2243,18 +2284,42 @@ impl Connection {
             }
 
             if let Err(e) = self.process_frame(frame, epoch, now) {
-                qlog_with_type!(QLOG_PACKET_RX, self.qlog, q, {
-                    // Always conclude frame writing on error.
-                    q.finish_frames().ok();
-                });
-
-                return Err(e);
+                frame_processing_err = Some(e);
+                break;
             }
         }
 
         qlog_with_type!(QLOG_PACKET_RX, self.qlog, q, {
-            // Always conclude frame writing.
-            q.finish_frames().ok();
+            let packet_size = b.len();
+
+            let qlog_pkt_hdr = qlog::events::quic::PacketHeader::with_type(
+                hdr.ty.to_qlog(),
+                pn,
+                Some(hdr.version),
+                Some(&hdr.scid),
+                Some(&hdr.dcid),
+            );
+
+            let qlog_raw_info = RawInfo {
+                length: Some(packet_size as u64),
+                payload_length: Some(payload_len as u64),
+                data: None,
+            };
+
+            let ev_data =
+                EventData::PacketReceived(qlog::events::quic::PacketReceived {
+                    header: qlog_pkt_hdr,
+                    frames: Some(qlog_frames),
+                    is_coalesced: None,
+                    retry_token: None,
+                    stateless_reset_token: None,
+                    supported_versions: None,
+                    raw: Some(qlog_raw_info),
+                    datagram_id: None,
+                    trigger: None,
+                });
+
+            q.add_event_data_with_instant(ev_data, now).ok();
         });
 
         qlog_with_type!(QLOG_PACKET_RX, self.qlog, q, {
@@ -2262,6 +2327,11 @@ impl Connection {
                 q.add_event_data_with_instant(ev_data, now).ok();
             }
         });
+
+        if let Some(e) = frame_processing_err {
+            // Any frame error is terminal, so now just return.
+            return Err(e);
+        }
 
         // Only log the remote transport parameters once the connection is
         // established (i.e. after frames have been fully parsed) and only
@@ -2540,6 +2610,8 @@ impl Connection {
         }
 
         if done == 0 {
+            self.last_tx_data = self.tx_data;
+
             return Err(Error::Done);
         }
 
@@ -2557,10 +2629,7 @@ impl Connection {
         let info = SendInfo {
             to: self.peer_addr,
 
-            at: self
-                .recovery
-                .get_packet_send_time()
-                .unwrap_or_else(time::Instant::now),
+            at: self.recovery.get_packet_send_time(),
         };
 
         Ok((done, info))
@@ -2587,8 +2656,6 @@ impl Connection {
 
         let epoch = pkt_type.to_epoch()?;
 
-        let stream_retrans_bytes = self.stream_retrans_bytes;
-
         // Process lost frames.
         for lost in self.recovery.lost[epoch].drain(..) {
             match lost {
@@ -2599,6 +2666,8 @@ impl Connection {
                         .retransmit(offset, length);
 
                     self.stream_retrans_bytes += length as u64;
+
+                    self.retrans_count += 1;
                 },
 
                 frame::Frame::StreamHeader {
@@ -2635,6 +2704,8 @@ impl Connection {
                     }
 
                     self.stream_retrans_bytes += length as u64;
+
+                    self.retrans_count += 1;
                 },
 
                 frame::Frame::ACK { .. } => {
@@ -2669,10 +2740,6 @@ impl Connection {
 
                 _ => (),
             }
-        }
-
-        if stream_retrans_bytes > self.stream_retrans_bytes {
-            self.retrans_count += 1;
         }
 
         let mut left = b.cap();
@@ -3352,6 +3419,17 @@ impl Connection {
             pn
         );
 
+        #[cfg(feature = "qlog")]
+        let mut qlog_frames = Vec::with_capacity(frames.len());
+
+        for frame in &mut frames {
+            trace!("{} tx frm {:?}", self.trace_id, frame);
+
+            qlog_with_type!(QLOG_PACKET_TX, self.qlog, _q, {
+                qlog_frames.push(frame.to_qlog());
+            });
+        }
+
         qlog_with_type!(QLOG_PACKET_TX, self.qlog, q, {
             let qlog_pkt_hdr = qlog::events::quic::PacketHeader::with_type(
                 hdr.ty.to_qlog(),
@@ -3374,28 +3452,17 @@ impl Connection {
 
             let ev_data = EventData::PacketSent(qlog::events::quic::PacketSent {
                 header: qlog_pkt_hdr,
-                frames: Some(vec![]),
+                frames: Some(qlog_frames),
                 is_coalesced: None,
                 retry_token: None,
                 stateless_reset_token: None,
                 supported_versions: None,
                 raw: Some(qlog_raw_info),
                 datagram_id: None,
+                trigger: None,
             });
 
             q.add_event_data_with_instant(ev_data, now).ok();
-        });
-
-        for frame in &mut frames {
-            trace!("{} tx frm {:?}", self.trace_id, frame);
-
-            qlog_with_type!(QLOG_PACKET_TX, self.qlog, q, {
-                q.add_frame(frame.to_qlog(), false).ok();
-            });
-        }
-
-        qlog_with_type!(QLOG_PACKET_TX, self.qlog, q, {
-            q.finish_frames().ok();
         });
 
         let aead = match self.pkt_num_spaces[epoch].crypto_seal {
@@ -3424,10 +3491,14 @@ impl Connection {
             in_flight,
             delivered: 0,
             delivered_time: now,
-            recent_delivered_packet_sent_time: now,
+            first_sent_time: now,
             is_app_limited: false,
             has_data,
         };
+
+        if in_flight && self.delivery_rate_check_if_app_limited() {
+            self.recovery.delivery_rate_update_app_limited(true);
+        }
 
         self.recovery.on_packet_sent(
             sent_pkt,
@@ -3472,6 +3543,19 @@ impl Connection {
         }
 
         Ok((pkt_type, written))
+    }
+
+    /// Returns the size of the send quantum, in bytes.
+    ///
+    /// This represents the maximum size of a packet burst as determined by the
+    /// congestion control algorithm in use.
+    ///
+    /// Applications can, for example, use it in conjuction with segmentatation
+    /// offloading mechanisms as the maximum limit for outgoing aggregates of
+    /// multiple packets.
+    #[inline]
+    pub fn send_quantum(&mut self) -> usize {
+        self.recovery.send_quantum()
     }
 
     /// Reads contiguous data from a stream into the provided slice.
@@ -3693,8 +3777,12 @@ impl Connection {
         if sent < buf.len() {
             let max_off = stream.send.max_off();
 
-            self.streams.mark_blocked(stream_id, true, max_off);
+            if stream.send.blocked_at() != Some(max_off) {
+                stream.send.update_blocked_at(Some(max_off));
+                self.streams.mark_blocked(stream_id, true, max_off);
+            }
         } else {
+            stream.send.update_blocked_at(None);
             self.streams.mark_blocked(stream_id, false, 0);
         }
 
@@ -3714,8 +3802,6 @@ impl Connection {
         self.tx_cap -= sent;
 
         self.tx_data += sent as u64;
-
-        self.recovery.rate_check_app_limited();
 
         qlog_with_type!(QLOG_DATA_MV, self.qlog, q, {
             let ev_data = EventData::DataMoved(qlog::events::quic::DataMoved {
@@ -4775,12 +4861,27 @@ impl Connection {
     ///
     /// If the connection is already established, it does nothing.
     fn do_handshake(&mut self) -> Result<()> {
+        let mut ex_data = tls::ExData {
+            application_protos: &self.application_protos,
+
+            pkt_num_spaces: &mut self.pkt_num_spaces,
+
+            session: &mut self.session,
+
+            local_error: &mut self.local_error,
+
+            keylog: self.keylog.as_mut(),
+
+            trace_id: &self.trace_id,
+
+            is_server: self.is_server,
+        };
+
         if self.handshake_completed {
-            // Handshake is already complete, nothing more to do.
-            return Ok(());
+            return self.handshake.process_post_handshake(&mut ex_data);
         }
 
-        match self.handshake.do_handshake() {
+        match self.handshake.do_handshake(&mut ex_data) {
             Ok(_) => (),
 
             Err(Error::Done) => {
@@ -4958,6 +5059,10 @@ impl Connection {
                     self.handshake_confirmed = true;
                 }
 
+                if self.delivery_rate_check_if_app_limited() {
+                    self.recovery.delivery_rate_update_app_limited(true);
+                }
+
                 self.recovery.on_ack_received(
                     &ranges,
                     ack_delay,
@@ -5088,11 +5193,7 @@ impl Connection {
                     self.handshake.provide_data(level, recv_buf)?;
                 }
 
-                if self.is_established() {
-                    self.handshake.process_post_handshake()?;
-                } else {
-                    self.do_handshake()?;
-                }
+                self.do_handshake()?;
             },
 
             frame::Frame::CryptoHeader { .. } => unreachable!(),
@@ -5389,6 +5490,28 @@ impl Connection {
             self.max_tx_data - self.tx_data,
         ) as usize;
     }
+
+    fn delivery_rate_check_if_app_limited(&self) -> bool {
+        // Enter the app-limited phase of delivery rate when these conditions
+        // are met:
+        //
+        // - The remaining capacity is higher than available bytes in cwnd (there
+        //   is more room to send).
+        // - New data since the last send() is smaller than available bytes in
+        //   cwnd (we queued less than what we can send).
+        // - There is room to send more data in cwnd.
+        //
+        // In application-limited phases the transmission rate is limited by the
+        // application rather than the congestion control algorithm.
+        //
+        // Note that this is equivalent to CheckIfApplicationLimited() from the
+        // delivery rate draft. This is also separate from `recovery.app_limited`
+        // and only applies to delivery rate calculation.
+        self.tx_cap >= self.recovery.cwnd_available() &&
+            (self.tx_data.saturating_sub(self.last_tx_data)) <
+                self.recovery.cwnd_available() as u64 &&
+            self.recovery.cwnd_available() > 0
+    }
 }
 
 /// Maps an `Error` to `Error::Done`, or itself.
@@ -5467,6 +5590,13 @@ pub struct Stats {
     pub pmtu: usize,
 
     /// The most recent data delivery rate estimate in bytes/s.
+    ///
+    /// Note that this value could be inaccurate if the application does not
+    /// respect pacing hints (see [`SendInfo.at`] and [Pacing] for more
+    /// details).
+    ///
+    /// [`SendInfo.at`]: struct.SendInfo.html#structfield.at
+    /// [Pacing]: index.html#pacing
     pub delivery_rate: u64,
 
     /// The maximum idle timeout.
@@ -5514,8 +5644,8 @@ impl std::fmt::Debug for Stats {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "recv={} sent={} lost={} rtt={:?} cwnd={}",
-            self.recv, self.sent, self.lost, self.rtt, self.cwnd,
+            "recv={} sent={} lost={} retrans={} rtt={:?} cwnd={}",
+            self.recv, self.sent, self.lost, self.retrans, self.rtt, self.cwnd,
         )?;
 
         write!(f, " peer_tps={{")?;
@@ -5998,8 +6128,8 @@ pub mod testing {
     use super::*;
 
     pub struct Pipe {
-        pub client: Pin<Box<Connection>>,
-        pub server: Pin<Box<Connection>>,
+        pub client: Connection,
+        pub server: Connection,
     }
 
     impl Pipe {
@@ -9576,12 +9706,57 @@ mod tests {
 
         assert_eq!(iter.next(), None);
 
-        // Send again from blocked stream and make sure it is marked as blocked
-        // again.
+        // Send again from blocked stream and make sure it is not marked as
+        // blocked again.
         assert_eq!(
             pipe.client.stream_send(0, b"aaaaaa", false),
             Err(Error::Done)
         );
+        assert_eq!(pipe.client.streams.blocked().len(), 0);
+        assert_eq!(pipe.client.send(&mut buf), Err(Error::Done));
+    }
+
+    #[test]
+    fn stream_data_blocked_unblocked_flow_control() {
+        let mut buf = [0; 65535];
+        let mut pipe = testing::Pipe::default().unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        assert_eq!(
+            pipe.client.stream_send(0, b"aaaaaaaaaaaaaaah", false),
+            Ok(15)
+        );
+        assert_eq!(pipe.client.streams.blocked().len(), 1);
+        assert_eq!(pipe.advance(), Ok(()));
+        assert_eq!(pipe.client.streams.blocked().len(), 0);
+
+        // Send again on blocked stream. It's blocked at the same offset as
+        // previously, so it should not be marked as blocked again.
+        assert_eq!(pipe.client.stream_send(0, b"h", false), Err(Error::Done));
+        assert_eq!(pipe.client.streams.blocked().len(), 0);
+
+        // No matter how many times we try to write stream data tried, no
+        // packets containing STREAM_BLOCKED should be emitted.
+        assert_eq!(pipe.client.stream_send(0, b"h", false), Err(Error::Done));
+        assert_eq!(pipe.client.send(&mut buf), Err(Error::Done));
+
+        assert_eq!(pipe.client.stream_send(0, b"h", false), Err(Error::Done));
+        assert_eq!(pipe.client.send(&mut buf), Err(Error::Done));
+
+        assert_eq!(pipe.client.stream_send(0, b"h", false), Err(Error::Done));
+        assert_eq!(pipe.client.send(&mut buf), Err(Error::Done));
+
+        // Now read some data at the server to release flow control.
+        let mut r = pipe.server.readable();
+        assert_eq!(r.next(), Some(0));
+        assert_eq!(r.next(), None);
+
+        let mut b = [0; 10];
+        assert_eq!(pipe.server.stream_recv(0, &mut b), Ok((10, false)));
+        assert_eq!(&b[..10], b"aaaaaaaaaa");
+        assert_eq!(pipe.advance(), Ok(()));
+
+        assert_eq!(pipe.client.stream_send(0, b"hhhhhhhhhh!", false), Ok(10));
         assert_eq!(pipe.client.streams.blocked().len(), 1);
 
         let (len, _) = pipe.client.send(&mut buf).unwrap();
@@ -9596,13 +9771,15 @@ mod tests {
             iter.next(),
             Some(&frame::Frame::StreamDataBlocked {
                 stream_id: 0,
-                limit: 15,
+                limit: 25,
             })
         );
 
-        assert_eq!(iter.next(), Some(&frame::Frame::Padding { len: 1 }));
+        // don't care about remaining received frames
 
-        assert_eq!(iter.next(), None);
+        assert_eq!(pipe.client.stream_send(0, b"!", false), Err(Error::Done));
+        assert_eq!(pipe.client.streams.blocked().len(), 0);
+        assert_eq!(pipe.client.send(&mut buf), Err(Error::Done));
     }
 
     #[test]
@@ -10350,6 +10527,7 @@ mod tests {
                 data: stream::RangeBuf::from(b"b", 0, false),
             })
         );
+        assert_eq!(pipe.client.stats().retrans, 1);
     }
 
     #[test]
@@ -11150,6 +11328,132 @@ mod tests {
 
         assert_eq!(pipe.advance(), Ok(()));
     }
+
+    #[cfg(feature = "boringssl-boring-crate")]
+    #[test]
+    fn user_provided_boring_ctx() -> Result<()> {
+        // Manually construct boring ssl ctx for server
+        let server_tls_ctx = {
+            let mut builder = boring::ssl::SslContextBuilder::new(
+                boring::ssl::SslMethod::tls(),
+            )
+            .unwrap();
+            builder
+                .set_certificate_chain_file("examples/cert.crt")
+                .unwrap();
+            builder
+                .set_private_key_file(
+                    "examples/cert.key",
+                    boring::ssl::SslFiletype::PEM,
+                )
+                .unwrap();
+            builder.build()
+        };
+
+        let mut server_config =
+            Config::with_boring_ssl_ctx(crate::PROTOCOL_VERSION, server_tls_ctx)?;
+        let mut client_config = Config::new(crate::PROTOCOL_VERSION)?;
+        client_config.load_cert_chain_from_pem_file("examples/cert.crt")?;
+        client_config.load_priv_key_from_pem_file("examples/cert.key")?;
+
+        for config in [&mut client_config, &mut server_config] {
+            config.set_application_protos(b"\x06proto1\x06proto2")?;
+            config.set_initial_max_data(30);
+            config.set_initial_max_stream_data_bidi_local(15);
+            config.set_initial_max_stream_data_bidi_remote(15);
+            config.set_initial_max_stream_data_uni(10);
+            config.set_initial_max_streams_bidi(3);
+            config.set_initial_max_streams_uni(3);
+            config.set_max_idle_timeout(180_000);
+            config.verify_peer(false);
+            config.set_ack_delay_exponent(8);
+        }
+
+        let mut client_scid = [0; 16];
+        rand::rand_bytes(&mut client_scid[..]);
+        let client_scid = ConnectionId::from_ref(&client_scid);
+        let client_addr = "127.0.0.1:1234".parse().unwrap();
+
+        let mut server_scid = [0; 16];
+        rand::rand_bytes(&mut server_scid[..]);
+        let server_scid = ConnectionId::from_ref(&server_scid);
+        let server_addr = "127.0.0.1:4321".parse().unwrap();
+
+        let mut pipe = testing::Pipe {
+            client: connect(
+                Some("quic.tech"),
+                &client_scid,
+                client_addr,
+                &mut client_config,
+            )?,
+            server: accept(&server_scid, None, server_addr, &mut server_config)?,
+        };
+
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        Ok(())
+    }
+
+    #[test]
+    /// Tests that resetting a stream restores flow control for unsent data.
+    fn last_tx_data_larger_than_tx_data() {
+        let mut config = Config::new(PROTOCOL_VERSION).unwrap();
+        config
+            .set_application_protos(b"\x06proto1\x06proto2")
+            .unwrap();
+        config.set_initial_max_data(12000);
+        config.set_initial_max_stream_data_bidi_local(20000);
+        config.set_initial_max_stream_data_bidi_remote(20000);
+        config.set_max_recv_udp_payload_size(1200);
+        config.verify_peer(false);
+
+        let mut pipe = testing::Pipe::with_client_config(&mut config).unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        // Client opens stream 4 and 8.
+        assert_eq!(pipe.client.stream_send(4, b"a", true), Ok(1));
+        assert_eq!(pipe.client.stream_send(8, b"b", true), Ok(1));
+        assert_eq!(pipe.advance(), Ok(()));
+
+        // Server reads stream data.
+        let mut b = [0; 15];
+        pipe.server.stream_recv(4, &mut b).unwrap();
+
+        // Server sends stream data close to cwnd (12000).
+        let buf = [0; 10000];
+        assert_eq!(pipe.server.stream_send(4, &buf, false), Ok(10000));
+
+        testing::emit_flight(&mut pipe.server).unwrap();
+
+        // Server buffers some data, until send capacity limit reached.
+        let mut buf = [0; 1200];
+        assert_eq!(pipe.server.stream_send(4, &buf, false), Ok(1200));
+        assert_eq!(pipe.server.stream_send(8, &buf, false), Ok(800));
+        assert_eq!(pipe.server.stream_send(4, &buf, false), Err(Error::Done));
+
+        // Wait for PTO to expire.
+        let timer = pipe.server.timeout().unwrap();
+        std::thread::sleep(timer + time::Duration::from_millis(1));
+
+        pipe.server.on_timeout();
+
+        // Server sends PTO probe (not limited to cwnd),
+        // to update last_tx_data.
+        let (len, _) = pipe.server.send(&mut buf).unwrap();
+        assert_eq!(len, 1200);
+
+        // Client sends STOP_SENDING to decrease tx_data
+        // by unsent data. It will make last_tx_data > tx_data
+        // and trigger #1232 bug.
+        let frames = [frame::Frame::StopSending {
+            stream_id: 4,
+            error_code: 42,
+        }];
+
+        let pkt_type = packet::Type::Short;
+        pipe.send_pkt_to_server(pkt_type, &frames, &mut buf)
+            .unwrap();
+    }
 }
 
 pub use crate::packet::ConnectionId;
@@ -11168,7 +11472,6 @@ mod flowcontrol;
 mod frame;
 pub mod h3;
 mod minmax;
-mod octets;
 mod packet;
 mod rand;
 mod ranges;

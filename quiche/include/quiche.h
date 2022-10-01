@@ -308,6 +308,9 @@ typedef struct {
 ssize_t quiche_conn_send(quiche_conn *conn, uint8_t *out, size_t out_len,
                          quiche_send_info *out_info);
 
+// Returns the size of the send quantum, in bytes.
+size_t quiche_conn_send_quantum(quiche_conn *conn);
+
 // Reads contiguous data from a stream.
 ssize_t quiche_conn_stream_recv(quiche_conn *conn, uint64_t stream_id,
                                 uint8_t *out, size_t buf_len, bool *fin);
@@ -600,8 +603,7 @@ enum quiche_h3_error {
     // QPACK Header block decompression failure.
     QUICHE_H3_ERR_QPACK_DECOMPRESSION_FAILED = -11,
 
-    // Error originated from the transport layer.
-    QUICHE_H3_ERR_TRANSPORT_ERROR = -12,
+    // -12 was previously used for TransportError, skip it
 
     // The underlying QUIC stream (or connection) doesn't have enough capacity
     // for the operation to complete. The application should retry later on.
@@ -630,6 +632,57 @@ enum quiche_h3_error {
     // The requested operation cannot be served over HTTP/3. Peer should retry
     // over HTTP/1.1.
     QUICHE_H3_ERR_VERSION_FALLBACK = -20,
+
+    // The following QUICHE_H3_TRANSPORT_ERR_* errors are propagated
+    // from the QUIC transport layer.
+
+    // See QUICHE_ERR_DONE.
+    QUICHE_H3_TRANSPORT_ERR_DONE = QUICHE_ERR_DONE - 1000,
+
+    // See QUICHE_ERR_BUFFER_TOO_SHORT.
+    QUICHE_H3_TRANSPORT_ERR_BUFFER_TOO_SHORT = QUICHE_ERR_BUFFER_TOO_SHORT - 1000,
+
+    // See QUICHE_ERR_UNKNOWN_VERSION.
+    QUICHE_H3_TRANSPORT_ERR_UNKNOWN_VERSION = QUICHE_ERR_UNKNOWN_VERSION - 1000,
+
+    // See QUICHE_ERR_INVALID_FRAME.
+    QUICHE_H3_TRANSPORT_ERR_INVALID_FRAME = QUICHE_ERR_INVALID_FRAME - 1000,
+
+    // See QUICHE_ERR_INVALID_PACKET.
+    QUICHE_H3_TRANSPORT_ERR_INVALID_PACKET = QUICHE_ERR_INVALID_PACKET - 1000,
+
+    // See QUICHE_ERR_INVALID_STATE.
+    QUICHE_H3_TRANSPORT_ERR_INVALID_STATE = QUICHE_ERR_INVALID_STATE - 1000,
+
+    // See QUICHE_ERR_INVALID_STREAM_STATE.
+    QUICHE_H3_TRANSPORT_ERR_INVALID_STREAM_STATE = QUICHE_ERR_INVALID_STREAM_STATE - 1000,
+
+    // See QUICHE_ERR_INVALID_TRANSPORT_PARAM.
+    QUICHE_H3_TRANSPORT_ERR_INVALID_TRANSPORT_PARAM = QUICHE_ERR_INVALID_TRANSPORT_PARAM - 1000,
+
+    // See QUICHE_ERR_CRYPTO_FAIL.
+    QUICHE_H3_TRANSPORT_ERR_CRYPTO_FAIL = QUICHE_ERR_CRYPTO_FAIL - 1000,
+
+    // See QUICHE_ERR_TLS_FAIL.
+    QUICHE_H3_TRANSPORT_ERR_TLS_FAIL = QUICHE_ERR_TLS_FAIL - 1000,
+
+    // See QUICHE_ERR_FLOW_CONTROL.
+    QUICHE_H3_TRANSPORT_ERR_FLOW_CONTROL = QUICHE_ERR_FLOW_CONTROL - 1000,
+
+    // See QUICHE_ERR_STREAM_LIMIT.
+    QUICHE_H3_TRANSPORT_ERR_STREAM_LIMIT = QUICHE_ERR_STREAM_LIMIT - 1000,
+
+    // See QUICHE_ERR_STREAM_STOPPED.
+    QUICHE_H3_TRANSPORT_ERR_STREAM_STOPPED = QUICHE_ERR_STREAM_STOPPED - 1000,
+
+    // See QUICHE_ERR_STREAM_RESET.
+    QUICHE_H3_TRANSPORT_ERR_STREAM_RESET = QUICHE_ERR_STREAM_RESET - 1000,
+
+    // See QUICHE_ERR_FINAL_SIZE.
+    QUICHE_H3_TRANSPORT_ERR_FINAL_SIZE = QUICHE_ERR_FINAL_SIZE - 1000,
+
+    // See QUICHE_ERR_CONGESTION_CONTROL.
+    QUICHE_H3_TRANSPORT_ERR_CONGESTION_CONTROL = QUICHE_ERR_CONGESTION_CONTROL - 1000,
 };
 
 // Stores configuration shared between multiple connections.
@@ -668,6 +721,7 @@ enum quiche_h3_event_type {
     QUICHE_H3_EVENT_DATAGRAM,
     QUICHE_H3_EVENT_GOAWAY,
     QUICHE_H3_EVENT_RESET,
+    QUICHE_H3_EVENT_PRIORITY_UPDATE,
 };
 
 typedef struct Http3Event quiche_h3_event;
@@ -715,6 +769,12 @@ typedef struct {
     size_t value_len;
 } quiche_h3_header;
 
+// Extensible Priorities parameters.
+typedef struct {
+    uint8_t urgency;
+    bool incremental;
+} quiche_h3_priority;
+
 // Sends an HTTP/3 request.
 int64_t quiche_h3_send_request(quiche_h3_conn *conn, quiche_conn *quic_conn,
                                quiche_h3_header *headers, size_t headers_len,
@@ -729,7 +789,7 @@ int quiche_h3_send_response(quiche_h3_conn *conn, quiche_conn *quic_conn,
 int quiche_h3_send_response_with_priority(quiche_h3_conn *conn,
                             quiche_conn *quic_conn, uint64_t stream_id,
                             quiche_h3_header *headers, size_t headers_len,
-                            const char *priority, bool fin);
+                            quiche_h3_priority *priority, bool fin);
 
 // Sends an HTTP/3 body chunk on the given stream.
 ssize_t quiche_h3_send_body(quiche_h3_conn *conn, quiche_conn *quic_conn,
@@ -739,6 +799,23 @@ ssize_t quiche_h3_send_body(quiche_h3_conn *conn, quiche_conn *quic_conn,
 // Reads request or response body data into the provided buffer.
 ssize_t quiche_h3_recv_body(quiche_h3_conn *conn, quiche_conn *quic_conn,
                             uint64_t stream_id, uint8_t *out, size_t out_len);
+
+// Try to parse an Extensible Priority field value.
+int quiche_h3_parse_extensible_priority(uint8_t *priority,
+                                        size_t priority_len,
+                                        quiche_h3_priority *parsed);
+
+// Take the last received PRIORITY_UPDATE frame for a stream.
+//
+// The `cb` callback will be called once. `cb` should check the validity of
+// priority field value contents. If `cb` returns any value other than `0`,
+// processing will be interrupted and the value is returned to the caller.
+int quiche_h3_take_last_priority_update(quiche_h3_conn *conn,
+                                        uint64_t prioritized_element_id,
+                                        int (*cb)(uint8_t  *priority_field_value,
+                                                  uint64_t priority_field_value_len,
+                                                  void *argp),
+                                        void *argp);
 
 // Returns whether the peer enabled HTTP/3 DATAGRAM frame support.
 bool quiche_h3_dgram_enabled_by_peer(quiche_h3_conn *conn,
