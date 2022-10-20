@@ -47,14 +47,14 @@ pub const MAX_DGRAM_OVERHEAD: usize = 2;
 pub const MAX_STREAM_OVERHEAD: usize = 12;
 pub const MAX_STREAM_SIZE: u64 = 1 << 62;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EcnCounts {
     ect0_count: u64,
     ect1_count: u64,
     ecn_ce_count: u64,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Frame {
     Padding {
         len: usize,
@@ -184,8 +184,6 @@ impl Frame {
         b: &mut octets::Octets, pkt: packet::Type,
     ) -> Result<Frame> {
         let frame_type = b.get_varint()?;
-
-        // println!("GOT FRAME {:x}", frame_type);
 
         let frame = match frame_type {
             0x00 => {
@@ -800,6 +798,16 @@ impl Frame {
         )
     }
 
+    pub fn probing(&self) -> bool {
+        matches!(
+            self,
+            Frame::Padding { .. } |
+                Frame::NewConnectionId { .. } |
+                Frame::PathChallenge { .. } |
+                Frame::PathResponse { .. }
+        )
+    }
+
     #[cfg(feature = "qlog")]
     pub fn to_qlog(&self) -> QuicFrame {
         match self {
@@ -866,8 +874,8 @@ impl Frame {
             Frame::NewToken { token } => QuicFrame::NewToken {
                 token: qlog::Token {
                     // TODO: pick the token type some how
-                    ty: Some(qlog::TokenType::StatelessReset),
-                    length: None,
+                    ty: Some(qlog::TokenType::Retry),
+                    length: Some(token.len() as u32),
                     data: qlog::HexSlice::maybe_string(Some(token)),
                     details: None,
                 },
@@ -940,12 +948,9 @@ impl Frame {
                 retire_prior_to: *retire_prior_to as u32,
                 connection_id_length: Some(conn_id.len() as u8),
                 connection_id: format!("{}", qlog::HexSlice::new(conn_id)),
-                stateless_reset_token: Some(qlog::Token {
-                    ty: Some(qlog::TokenType::StatelessReset),
-                    length: None,
-                    data: qlog::HexSlice::maybe_string(Some(reset_token)),
-                    details: None,
-                }),
+                stateless_reset_token: qlog::HexSlice::maybe_string(Some(
+                    reset_token,
+                )),
             },
 
             Frame::RetireConnectionId { seq_num } =>
@@ -964,7 +969,7 @@ impl Frame {
                 error_space: Some(ErrorSpace::TransportError),
                 error_code: Some(*error_code),
                 raw_error_code: None, // raw error is no different for us
-                reason: Some(String::from_utf8(reason.clone()).unwrap()),
+                reason: Some(String::from_utf8_lossy(reason).into_owned()),
                 trigger_frame_type: None, // don't know trigger type
             },
 
@@ -973,7 +978,7 @@ impl Frame {
                     error_space: Some(ErrorSpace::ApplicationError),
                     error_code: Some(*error_code),
                     raw_error_code: None, // raw error is no different for us
-                    reason: Some(String::from_utf8(reason.clone()).unwrap()),
+                    reason: Some(String::from_utf8_lossy(reason).into_owned()),
                     trigger_frame_type: None, // don't know trigger type
                 },
 
@@ -1110,12 +1115,21 @@ impl std::fmt::Debug for Frame {
                 write!(f, "STREAMS_BLOCKED type=uni limit={}", limit)?;
             },
 
-            Frame::NewConnectionId { .. } => {
-                write!(f, "NEW_CONNECTION_ID (TODO)")?;
+            Frame::NewConnectionId {
+                seq_num,
+                retire_prior_to,
+                conn_id,
+                reset_token,
+            } => {
+                write!(
+                    f,
+                    "NEW_CONNECTION_ID seq_num={} retire_prior_to={} conn_id={:02x?} reset_token={:02x?}",
+                    seq_num, retire_prior_to, conn_id, reset_token,
+                )?;
             },
 
-            Frame::RetireConnectionId { .. } => {
-                write!(f, "RETIRE_CONNECTION_ID (TODO)")?;
+            Frame::RetireConnectionId { seq_num } => {
+                write!(f, "RETIRE_CONNECTION_ID seq_num={}", seq_num)?;
             },
 
             Frame::PathChallenge { data } => {
@@ -1360,7 +1374,7 @@ mod tests {
         };
 
         assert_eq!(wire_len, 1);
-        assert_eq!(&d[..wire_len], [0x01 as u8]);
+        assert_eq!(&d[..wire_len], [0x01_u8]);
 
         let mut b = octets::Octets::with_slice(&d);
         assert_eq!(Frame::from_bytes(&mut b, packet::Type::Short), Ok(frame));

@@ -46,6 +46,7 @@ use crate::recovery::Recovery;
 
 pub static CUBIC: CongestionControlOps = CongestionControlOps {
     on_init,
+    reset,
     on_packet_sent,
     on_packets_acked,
     congestion_event,
@@ -146,6 +147,10 @@ impl State {
 }
 
 fn on_init(_r: &mut Recovery) {}
+
+fn reset(r: &mut Recovery) {
+    r.cubic_state = State::default();
+}
 
 fn collapse_cwnd(r: &mut Recovery) {
     let cubic = &mut r.cubic_state;
@@ -741,7 +746,7 @@ mod tests {
 
         r.hystart.start_round(send_pn - 1);
 
-        // Receving Acks.
+        // Receiving Acks.
         let now = now + rtt_1st;
         for _ in 0..n_rtt_sample {
             r.update_rtt(rtt_1st, Duration::from_millis(0), now);
@@ -775,7 +780,7 @@ mod tests {
         }
         r.hystart.start_round(send_pn - 1);
 
-        // Receving Acks.
+        // Receiving Acks.
         // Last ack will cause to exit to CSS.
         let mut cwnd_prev = r.cwnd();
 
@@ -818,7 +823,7 @@ mod tests {
         }
         r.hystart.start_round(send_pn - 1);
 
-        // Receving Acks.
+        // Receiving Acks.
         // Last ack will cause to exit to SS.
         for _ in 0..n_rtt_sample {
             r.update_rtt(rtt_3rd, Duration::from_millis(0), now);
@@ -889,7 +894,7 @@ mod tests {
 
         r.hystart.start_round(send_pn - 1);
 
-        // Receving Acks.
+        // Receiving Acks.
         let now = now + rtt_1st;
         for _ in 0..n_rtt_sample {
             r.update_rtt(rtt_1st, Duration::from_millis(0), now);
@@ -923,7 +928,7 @@ mod tests {
         }
         r.hystart.start_round(send_pn - 1);
 
-        // Receving Acks.
+        // Receiving Acks.
         // Last ack will cause to exit to CSS.
         let mut cwnd_prev = r.cwnd();
 
@@ -965,7 +970,7 @@ mod tests {
             }
             r.hystart.start_round(send_pn - 1);
 
-            // Receving Acks.
+            // Receiving Acks.
             for _ in 0..n_rtt_sample {
                 r.update_rtt(rtt_css, Duration::from_millis(0), now);
 
@@ -1032,7 +1037,7 @@ mod tests {
         // Ack more than cwnd bytes with rtt=100ms
         r.update_rtt(rtt, Duration::from_millis(0), now);
 
-        // Trigger detecting sprurious congestion event
+        // Trigger detecting spurious congestion event
         r.on_packets_acked(
             acked,
             packet::EPOCH_APPLICATION,
@@ -1074,7 +1079,7 @@ mod tests {
         // Ack more than cwnd bytes with rtt=100ms.
         r.update_rtt(rtt, Duration::from_millis(0), now);
 
-        // Trigger detecting sprurious congestion event.
+        // Trigger detecting spurious congestion event.
         r.on_packets_acked(
             acked,
             packet::EPOCH_APPLICATION,

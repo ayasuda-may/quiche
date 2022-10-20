@@ -71,6 +71,13 @@ pub extern fn quiche_h3_config_set_qpack_blocked_streams(
 }
 
 #[no_mangle]
+pub extern fn quiche_h3_config_enable_extended_connect(
+    config: &mut h3::Config, enabled: bool,
+) {
+    config.enable_extended_connect(enabled);
+}
+
+#[no_mangle]
 pub extern fn quiche_h3_config_free(config: *mut h3::Config) {
     unsafe { Box::from_raw(config) };
 }
@@ -192,6 +199,13 @@ pub extern fn quiche_h3_event_headers_has_body(ev: &h3::Event) -> bool {
 }
 
 #[no_mangle]
+pub extern fn quiche_h3_extended_connect_enabled_by_peer(
+    conn: &h3::Connection,
+) -> bool {
+    conn.extended_connect_enabled_by_peer()
+}
+
+#[no_mangle]
 pub extern fn quiche_h3_event_free(ev: *mut h3::Event) {
     unsafe { Box::from_raw(ev) };
 }
@@ -302,6 +316,18 @@ pub extern fn quiche_h3_parse_extensible_priority(
             parsed.incremental = v.incremental;
             0
         },
+
+        Err(e) => e.to_c() as c_int,
+    }
+}
+
+#[no_mangle]
+pub extern fn quiche_h3_send_priority_update_for_request(
+    conn: &mut h3::Connection, quic_conn: &mut Connection, stream_id: u64,
+    priority: &Priority,
+) -> c_int {
+    match conn.send_priority_update_for_request(quic_conn, stream_id, priority) {
+        Ok(()) => 0,
 
         Err(e) => e.to_c() as c_int,
     }

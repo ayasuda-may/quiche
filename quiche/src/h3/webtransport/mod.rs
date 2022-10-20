@@ -1410,7 +1410,8 @@ pub mod testing {
             let mut config = crate::Config::new(crate::PROTOCOL_VERSION)?;
             config.load_cert_chain_from_pem_file("examples/cert.crt")?;
             config.load_priv_key_from_pem_file("examples/cert.key")?;
-            config.set_application_protos(b"\x02h3")?;
+            //config.set_application_protos(b"\x02h3")?;
+            config.set_application_protos(&[b"\x02h3"])?;
             config.set_initial_max_data(1500);
             config.set_initial_max_stream_data_bidi_local(150);
             config.set_initial_max_stream_data_bidi_remote(150);

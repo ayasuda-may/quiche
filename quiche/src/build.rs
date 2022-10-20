@@ -41,7 +41,7 @@ const CMAKE_PARAMS_ARM_LINUX: &[(&str, &[(&str, &str)])] = &[
 /// so adjust library location based on platform and build target.
 /// See issue: https://github.com/alexcrichton/cmake-rs/issues/18
 fn get_boringssl_platform_output_path() -> String {
-    if cfg!(windows) {
+    if cfg!(target_env = "msvc") {
         // Code under this branch should match the logic in cmake-rs
         let debug_env_var =
             std::env::var("DEBUG").expect("DEBUG variable not defined in env");
@@ -255,20 +255,21 @@ fn main() {
                     .cxxflag("-DBORINGSSL_UNSAFE_FUZZER_MODE");
             }
 
-            cfg.build_target("bssl").build().display().to_string()
+            cfg.build_target("ssl").build();
+            cfg.build_target("crypto").build().display().to_string()
         });
 
         let build_path = get_boringssl_platform_output_path();
         let build_dir = format!("{}/build/{}", bssl_dir, build_path);
         println!("cargo:rustc-link-search=native={}", build_dir);
 
-        println!("cargo:rustc-link-lib=static=crypto");
         println!("cargo:rustc-link-lib=static=ssl");
+        println!("cargo:rustc-link-lib=static=crypto");
     }
 
     if cfg!(feature = "boringssl-boring-crate") {
-        println!("cargo:rustc-link-lib=static=crypto");
         println!("cargo:rustc-link-lib=static=ssl");
+        println!("cargo:rustc-link-lib=static=crypto");
     }
 
     // MacOS: Allow cdylib to link with undefined symbols

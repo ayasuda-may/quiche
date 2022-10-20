@@ -1,4 +1,4 @@
-// Copyright (C) 2021, Cloudflare, Inc.
+// Copyright (C) 2022, Cloudflare, Inc.
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -24,58 +24,20 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use serde::Deserialize;
-use serde::Serialize;
+use crate::recovery::Recovery;
 
-use super::Bytes;
+// BBR Transmit Packet Pacing Functions
+//
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
-#[serde(rename_all = "snake_case")]
-pub enum KeyType {
-    ServerInitialSecret,
-    ClientInitialSecret,
+// 4.2.1. Pacing Rate
+pub fn bbr_set_pacing_rate_with_gain(r: &mut Recovery, pacing_gain: f64) {
+    let rate = (pacing_gain * r.bbr_state.btlbw as f64) as u64;
 
-    ServerHandshakeSecret,
-    ClientHandshakeSecret,
-
-    #[serde(rename = "server_0rtt_secret")]
-    Server0RttSecret,
-    #[serde(rename = "client_0rtt_secret")]
-    Client0RttSecret,
-    #[serde(rename = "server_1rtt_secret")]
-    Server1RttSecret,
-    #[serde(rename = "client_1rtt_secret")]
-    Client1RttSecret,
+    if r.bbr_state.filled_pipe || rate > r.bbr_state.pacing_rate {
+        r.bbr_state.pacing_rate = rate;
+    }
 }
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
-#[serde(rename_all = "snake_case")]
-pub enum KeyUpdateOrRetiredTrigger {
-    Tls,
-    RemoteUpdate,
-    LocalUpdate,
-}
-
-#[serde_with::skip_serializing_none]
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
-pub struct KeyUpdated {
-    pub key_type: KeyType,
-
-    pub old: Option<Bytes>,
-    pub new: Bytes,
-
-    pub generation: Option<u32>,
-
-    pub trigger: Option<KeyUpdateOrRetiredTrigger>,
-}
-
-#[serde_with::skip_serializing_none]
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
-pub struct KeyRetired {
-    pub key_type: KeyType,
-    pub key: Option<Bytes>,
-
-    pub generation: Option<u32>,
-
-    pub trigger: Option<KeyUpdateOrRetiredTrigger>,
+pub fn bbr_set_pacing_rate(r: &mut Recovery) {
+    bbr_set_pacing_rate_with_gain(r, r.bbr_state.pacing_gain);
 }

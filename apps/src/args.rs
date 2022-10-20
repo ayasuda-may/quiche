@@ -32,7 +32,7 @@ pub trait Args {
 
 /// Contains commons arguments for creating a quiche QUIC connection.
 pub struct CommonArgs {
-    pub alpns: Vec<u8>,
+    pub alpns: Vec<&'static [u8]>,
     pub max_data: u64,
     pub max_window: u64,
     pub max_stream_data: u64,
@@ -48,6 +48,11 @@ pub struct CommonArgs {
     pub dgrams_enabled: bool,
     pub dgram_count: u64,
     pub dgram_data: String,
+    pub max_active_cids: u64,
+    pub enable_active_migration: bool,
+    pub max_field_section_size: Option<u64>,
+    pub qpack_max_table_capacity: Option<u64>,
+    pub qpack_blocked_streams: Option<u64>,
 }
 
 /// Creates a new `CommonArgs` structure using the provided [`Docopt`].
@@ -68,6 +73,11 @@ pub struct CommonArgs {
 /// --dgram-proto PROTO         DATAGRAM application protocol.
 /// --dgram-count COUNT         Number of DATAGRAMs to send.
 /// --dgram-data DATA           DATAGRAM data to send.
+/// --max-active-cids NUM       Maximum number of active Connection IDs.
+/// --enable-active-migration   Enable active connection migration.
+/// --max-field-section-size BYTES  Max size of uncompressed field section.
+/// --qpack-max-table-capacity BYTES  Max capacity of dynamic QPACK decoding.
+/// --qpack-blocked-streams STREAMS  Limit of blocked streams while decoding.
 ///
 /// [`Docopt`]: https://docs.rs/docopt/1.1.0/docopt/
 impl Args for CommonArgs {
@@ -77,28 +87,24 @@ impl Args for CommonArgs {
         let http_version = args.get_str("--http-version");
         let dgram_proto = args.get_str("--dgram-proto");
         let (alpns, dgrams_enabled) = match (http_version, dgram_proto) {
-            ("HTTP/0.9", "none") =>
-                (alpns::length_prefixed(&alpns::HTTP_09), false),
+            ("HTTP/0.9", "none") => (alpns::HTTP_09.to_vec(), false),
 
             ("HTTP/0.9", _) =>
                 panic!("Unsupported HTTP version and DATAGRAM protocol."),
 
-            ("HTTP/3", "none") => (alpns::length_prefixed(&alpns::HTTP_3), false),
+            ("HTTP/3", "none") => (alpns::HTTP_3.to_vec(), false),
 
-            ("HTTP/3", "oneway") =>
-                (alpns::length_prefixed(&alpns::HTTP_3), true),
+            ("HTTP/3", "oneway") => (alpns::HTTP_3.to_vec(), true),
 
             ("all", "none") => (
-                [
-                    alpns::length_prefixed(&alpns::HTTP_3),
-                    alpns::length_prefixed(&alpns::HTTP_09),
-                ]
-                .concat(),
+                [alpns::HTTP_3.as_slice(), &alpns::HTTP_09]
+                    .concat()
+                    .to_vec(),
                 false,
             ),
 
             // SiDuck is it's own application protocol.
-            (_, "siduck") => (alpns::length_prefixed(&alpns::SIDUCK), true),
+            (_, "siduck") => (alpns::SIDUCK.to_vec(), true),
 
             (..) => panic!("Unsupported HTTP version and DATAGRAM protocol."),
         };
@@ -143,6 +149,44 @@ impl Args for CommonArgs {
 
         let disable_hystart = args.get_bool("--disable-hystart");
 
+        let max_active_cids = args.get_str("--max-active-cids");
+        let max_active_cids = max_active_cids.parse::<u64>().unwrap();
+
+        let enable_active_migration = args.get_bool("--enable-active-migration");
+
+        let max_field_section_size =
+            if args.get_str("--max-field-section-size") != "" {
+                Some(
+                    args.get_str("--max-field-section-size")
+                        .parse::<u64>()
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+
+        let qpack_max_table_capacity =
+            if args.get_str("--qpack-max-table-capacity") != "" {
+                Some(
+                    args.get_str("--qpack-max-table-capacity")
+                        .parse::<u64>()
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+
+        let qpack_blocked_streams =
+            if args.get_str("--qpack-blocked-streams") != "" {
+                Some(
+                    args.get_str("--qpack-blocked-streams")
+                        .parse::<u64>()
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+
         CommonArgs {
             alpns,
             max_data,
@@ -160,6 +204,11 @@ impl Args for CommonArgs {
             dgrams_enabled,
             dgram_count,
             dgram_data,
+            max_active_cids,
+            enable_active_migration,
+            max_field_section_size,
+            qpack_max_table_capacity,
+            qpack_blocked_streams,
         }
     }
 }
@@ -167,7 +216,7 @@ impl Args for CommonArgs {
 impl Default for CommonArgs {
     fn default() -> Self {
         CommonArgs {
-            alpns: alpns::length_prefixed(&alpns::HTTP_3),
+            alpns: alpns::HTTP_3.to_vec(),
             max_data: 10000000,
             max_window: 25165824,
             max_stream_data: 1000000,
@@ -183,6 +232,11 @@ impl Default for CommonArgs {
             dgrams_enabled: false,
             dgram_count: 0,
             dgram_data: "quack".to_string(),
+            max_active_cids: 2,
+            enable_active_migration: false,
+            max_field_section_size: None,
+            qpack_max_table_capacity: None,
+            qpack_blocked_streams: None,
         }
     }
 }
@@ -216,9 +270,17 @@ Options:
   --no-grease              Don't send GREASE.
   --cc-algorithm NAME      Specify which congestion control algorithm to use [default: cubic].
   --disable-hystart        Disable HyStart++.
+  --max-active-cids NUM    The maximum number of active Connection IDs we can support [default: 2].
+  --enable-active-migration   Enable active connection migration.
+  --perform-migration      Perform connection migration on another source port.
   -H --header HEADER ...   Add a request header.
   -n --requests REQUESTS   Send the given number of identical requests [default: 1].
+  --send-priority-update   Send HTTP/3 priority updates if the query string params 'u' or 'i' are present in URLs
+  --max-field-section-size BYTES    Max size of uncompressed field section. Default is unlimited.
+  --qpack-max-table-capacity BYTES  Max capacity of dynamic QPACK decoding.. Any value other that 0 is currently unsupported.
+  --qpack-blocked-streams STREAMS   Limit of blocked streams while decoding. Any value other that 0 is currently unsupported.
   --session-file PATH      File used to cache a TLS session for resumption.
+  --source-port PORT       Source port to use when connecting to the server [default: 0].
   -h --help                Show this screen.
 ";
 
@@ -235,6 +297,9 @@ pub struct ClientArgs {
     pub method: String,
     pub connect_to: Option<String>,
     pub session_file: Option<String>,
+    pub source_port: u16,
+    pub perform_migration: bool,
+    pub send_priority_update: bool,
 }
 
 impl Args for ClientArgs {
@@ -298,6 +363,13 @@ impl Args for ClientArgs {
             None
         };
 
+        let source_port = args.get_str("--source-port");
+        let source_port = source_port.parse::<u16>().unwrap();
+
+        let perform_migration = args.get_bool("--perform-migration");
+
+        let send_priority_update = args.get_bool("--send-priority-update");
+
         ClientArgs {
             version,
             dump_response_path,
@@ -310,6 +382,9 @@ impl Args for ClientArgs {
             method,
             connect_to,
             session_file,
+            source_port,
+            perform_migration,
+            send_priority_update,
         }
     }
 }
@@ -328,6 +403,9 @@ impl Default for ClientArgs {
             method: "GET".to_string(),
             connect_to: None,
             session_file: None,
+            source_port: 0,
+            perform_migration: false,
+            send_priority_update: false,
         }
     }
 }
@@ -360,6 +438,12 @@ Options:
   --dgram-data DATA           Data to send for certain types of DATAGRAM application protocol [default: brrr].
   --cc-algorithm NAME         Specify which congestion control algorithm to use [default: cubic].
   --disable-hystart           Disable HyStart++.
+  --max-active-cids NUM       The maximum number of active Connection IDs we can support [default: 2].
+  --enable-active-migration   Enable active connection migration.
+  --max-field-section-size BYTES    Max size of uncompressed HTTP/3 field section. Default is unlimited.
+  --qpack-max-table-capacity BYTES  Max capacity of QPACK dynamic table decoding. Any value other that 0 is currently unsupported.
+  --qpack-blocked-streams STREAMS   Limit of streams that can be blocked while decoding. Any value other that 0 is currently unsupported.
+  --disable-gso               Disable GSO (linux only).
   -h --help                   Show this screen.
 ";
 
@@ -371,6 +455,7 @@ pub struct ServerArgs {
     pub index: String,
     pub cert: String,
     pub key: String,
+    pub disable_gso: bool,
 }
 
 impl Args for ServerArgs {
@@ -383,6 +468,7 @@ impl Args for ServerArgs {
         let index = args.get_str("--index").to_string();
         let cert = args.get_str("--cert").to_string();
         let key = args.get_str("--key").to_string();
+        let disable_gso = args.get_bool("--disable-gso");
 
         ServerArgs {
             listen,
@@ -391,6 +477,7 @@ impl Args for ServerArgs {
             index,
             cert,
             key,
+            disable_gso,
         }
     }
 }

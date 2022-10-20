@@ -60,8 +60,9 @@
 //! ```no_run
 //! # let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
 //! # let scid = quiche::ConnectionId::from_ref(&[0xba; 16]);
-//! # let from = "127.0.0.1:1234".parse().unwrap();
-//! # let mut conn = quiche::accept(&scid, None, from, &mut config).unwrap();
+//! # let peer = "127.0.0.1:1234".parse().unwrap();
+//! # let local = "127.0.0.1:4321".parse().unwrap();
+//! # let mut conn = quiche::accept(&scid, None, local, peer, &mut config).unwrap();
 //! # let h3_config = quiche::h3::Config::new()?;
 //! let h3_conn = quiche::h3::Connection::with_transport(&mut conn, &h3_config)?;
 //! # Ok::<(), quiche::h3::Error>(())
@@ -76,8 +77,9 @@
 //! ```no_run
 //! # let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
 //! # let scid = quiche::ConnectionId::from_ref(&[0xba; 16]);
-//! # let to = "127.0.0.1:1234".parse().unwrap();
-//! # let mut conn = quiche::connect(None, &scid, to, &mut config).unwrap();
+//! # let peer = "127.0.0.1:1234".parse().unwrap();
+//! # let local = "127.0.0.1:4321".parse().unwrap();
+//! # let mut conn = quiche::connect(None, &scid, local, peer, &mut config).unwrap();
 //! # let h3_config = quiche::h3::Config::new()?;
 //! # let mut h3_conn = quiche::h3::Connection::with_transport(&mut conn, &h3_config)?;
 //! let req = vec![
@@ -98,8 +100,9 @@
 //! ```no_run
 //! # let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
 //! # let scid = quiche::ConnectionId::from_ref(&[0xba; 16]);
-//! # let to = "127.0.0.1:1234".parse().unwrap();
-//! # let mut conn = quiche::connect(None, &scid, to, &mut config).unwrap();
+//! # let peer = "127.0.0.1:1234".parse().unwrap();
+//! # let local = "127.0.0.1:4321".parse().unwrap();
+//! # let mut conn = quiche::connect(None, &scid, local, peer, &mut config).unwrap();
 //! # let h3_config = quiche::h3::Config::new()?;
 //! # let mut h3_conn = quiche::h3::Connection::with_transport(&mut conn, &h3_config)?;
 //! let req = vec![
@@ -129,8 +132,9 @@
 //!
 //! # let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
 //! # let scid = quiche::ConnectionId::from_ref(&[0xba; 16]);
-//! # let from = "127.0.0.1:1234".parse().unwrap();
-//! # let mut conn = quiche::accept(&scid, None, from, &mut config).unwrap();
+//! # let peer = "127.0.0.1:1234".parse().unwrap();
+//! # let local = "127.0.0.1:1234".parse().unwrap();
+//! # let mut conn = quiche::accept(&scid, None, local, peer, &mut config).unwrap();
 //! # let h3_config = quiche::h3::Config::new()?;
 //! # let mut h3_conn = quiche::h3::Connection::with_transport(&mut conn, &h3_config)?;
 //! loop {
@@ -199,8 +203,9 @@
 //!
 //! # let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
 //! # let scid = quiche::ConnectionId::from_ref(&[0xba; 16]);
-//! # let to = "127.0.0.1:1234".parse().unwrap();
-//! # let mut conn = quiche::connect(None, &scid, to, &mut config).unwrap();
+//! # let peer = "127.0.0.1:1234".parse().unwrap();
+//! # let local = "127.0.0.1:1234".parse().unwrap();
+//! # let mut conn = quiche::connect(None, &scid, local, peer, &mut config).unwrap();
 //! # let h3_config = quiche::h3::Config::new()?;
 //! # let mut h3_conn = quiche::h3::Connection::with_transport(&mut conn, &h3_config)?;
 //! loop {
@@ -290,6 +295,8 @@ use std::collections::VecDeque;
 
 #[cfg(feature = "sfv")]
 use std::convert::TryFrom;
+use std::fmt;
+use std::fmt::Write;
 
 #[cfg(feature = "qlog")]
 use qlog::events::h3::H3FrameCreated;
@@ -297,6 +304,8 @@ use qlog::events::h3::H3FrameCreated;
 use qlog::events::h3::H3FrameParsed;
 #[cfg(feature = "qlog")]
 use qlog::events::h3::H3Owner;
+#[cfg(feature = "qlog")]
+use qlog::events::h3::H3PriorityTargetStreamType;
 #[cfg(feature = "qlog")]
 use qlog::events::h3::H3StreamType;
 #[cfg(feature = "qlog")]
@@ -319,14 +328,14 @@ use qlog::events::EventType;
 ///
 /// [`Config::set_application_protos()`]:
 /// ../struct.Config.html#method.set_application_protos
-pub const APPLICATION_PROTOCOL: &[u8] = b"\x02h3\x05h3-29\x05h3-28\x05h3-27";
+pub const APPLICATION_PROTOCOL: &[&[u8]] = &[b"h3", b"h3-29", b"h3-28", b"h3-27"];
 
 // The offset used when converting HTTP/3 urgency to quiche urgency.
 const PRIORITY_URGENCY_OFFSET: u8 = 124;
 
 // Parameter values as specified in [Extensible Priorities].
 //
-// [Extensible Priorities]: https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-priority-12#section-4.
+// [Extensible Priorities]: https://www.rfc-editor.org/rfc/rfc9218.html#section-4.
 const PRIORITY_URGENCY_LOWER_BOUND: u8 = 0;
 const PRIORITY_URGENCY_UPPER_BOUND: u8 = 7;
 const PRIORITY_URGENCY_DEFAULT: u8 = 3;
@@ -351,7 +360,7 @@ const QLOG_STREAM_TYPE_SET: EventType =
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// An HTTP/3 error.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// There is no error or no work to do
     Done,
@@ -511,6 +520,7 @@ pub struct Config {
     qpack_max_table_capacity: Option<u64>,
     qpack_blocked_streams: Option<u64>,
     enable_webtransport: bool,
+    connect_protocol_enabled: Option<u64>,
 }
 
 impl Config {
@@ -521,6 +531,7 @@ impl Config {
             qpack_max_table_capacity: None,
             qpack_blocked_streams: None,
             enable_webtransport: false,
+            connect_protocol_enabled: None,
         })
     }
 
@@ -557,6 +568,17 @@ impl Config {
     pub fn set_enable_webtransport(&mut self, v: bool) {
         self.enable_webtransport = v;
     }
+
+    /// Sets or omits the `SETTINGS_ENABLE_CONNECT_PROTOCOL` setting.
+    ///
+    /// The default value is `false`.
+    pub fn enable_extended_connect(&mut self, enabled: bool) {
+        if enabled {
+            self.connect_protocol_enabled = Some(1);
+        } else {
+            self.connect_protocol_enabled = None;
+        }
+    }
 }
 
 /// A trait for types with associated string name and value.
@@ -568,9 +590,36 @@ pub trait NameValue {
     fn value(&self) -> &[u8];
 }
 
+impl NameValue for (&[u8], &[u8]) {
+    fn name(&self) -> &[u8] {
+        self.0
+    }
+
+    fn value(&self) -> &[u8] {
+        self.1
+    }
+}
+
 /// An owned name-value pair representing a raw HTTP header.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Header(Vec<u8>, Vec<u8>);
+
+fn try_print_as_readable(hdr: &[u8], f: &mut fmt::Formatter) -> fmt::Result {
+    match std::str::from_utf8(hdr) {
+        Ok(s) => f.write_str(&s.escape_default().to_string()),
+        Err(_) => write!(f, "{:?}", hdr),
+    }
+}
+
+impl fmt::Debug for Header {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_char('"')?;
+        try_print_as_readable(&self.0, f)?;
+        f.write_str(": ")?;
+        try_print_as_readable(&self.1, f)?;
+        f.write_char('"')
+    }
+}
 
 impl Header {
     /// Creates a new header.
@@ -592,7 +641,7 @@ impl NameValue for Header {
 }
 
 /// A non-owned name-value pair representing a raw HTTP header.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeaderRef<'a>(&'a [u8], &'a [u8]);
 
 impl<'a> HeaderRef<'a> {
@@ -613,7 +662,7 @@ impl<'a> NameValue for HeaderRef<'a> {
 }
 
 /// An HTTP/3 connection event.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     /// Request/response headers were received.
     Headers {
@@ -697,7 +746,7 @@ pub enum Event {
 /// Structured Fields Dictionary field value. I.e, use `TryFrom` to parse the
 /// value of a Priority header field or a PRIORITY_UPDATE frame. Using this
 /// trait requires the `sfv` feature to be enabled.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct Priority {
     urgency: u8,
@@ -742,7 +791,7 @@ impl TryFrom<&[u8]> for Priority {
     ///
     /// Omitted parameters will yield default values.
     ///
-    /// [Extensible Priorities]: https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-priority-12#section-4.
+    /// [Extensible Priorities]: https://www.rfc-editor.org/rfc/rfc9218.html#section-4.
     fn try_from(value: &[u8]) -> std::result::Result<Self, Self::Error> {
         let dict = match sfv::Parser::parse_dictionary(value) {
             Ok(v) => v,
@@ -793,6 +842,7 @@ struct ConnectionSettings {
     pub max_field_section_size: Option<u64>,
     pub qpack_max_table_capacity: Option<u64>,
     pub qpack_blocked_streams: Option<u64>,
+    pub connect_protocol_enabled: Option<u64>,
     pub h3_datagram: Option<u64>,
     pub enable_webtransport: Option<u64>,
     pub raw: Option<Vec<(u64, u64)>>,
@@ -858,6 +908,7 @@ impl Connection {
                 qpack_max_table_capacity: config.qpack_max_table_capacity,
                 qpack_blocked_streams: config.qpack_blocked_streams,
                 enable_webtransport: if config.enable_webtransport { Some(1) } else { None },
+                connect_protocol_enabled: config.connect_protocol_enabled,
                 h3_datagram,
                 raw: Default::default(),
             },
@@ -868,6 +919,7 @@ impl Connection {
                 qpack_blocked_streams: None,
                 h3_datagram: None,
                 enable_webtransport: None,
+                connect_protocol_enabled: None,
                 raw: Default::default(),
             },
 
@@ -908,12 +960,23 @@ impl Connection {
     /// On success the new connection is returned.
     ///
     /// The [`StreamLimit`] error is returned when the HTTP/3 control stream
-    /// cannot be created.
+    /// cannot be created due to stream limits.
     ///
-    /// [`StreamLimit`]: ../enum.Error.html#variant.InvalidState
+    /// The [`InternalError`] error is returned when either the underlying QUIC
+    /// connection is not in a suitable state, or the HTTP/3 control stream
+    /// cannot be created due to flow control limits.
+    ///
+    /// [`StreamLimit`]: ../enum.Error.html#variant.StreamLimit
+    /// [`InternalError`]: ../enum.Error.html#variant.InternalError
     pub fn with_transport(
         conn: &mut super::Connection, config: &Config,
     ) -> Result<Connection> {
+        let is_client = !conn.is_server;
+        if is_client && !(conn.is_established() || conn.is_in_early_data()) {
+            trace!("{} QUIC connection must be established or in early data before creating an HTTP/3 connection", conn.trace_id());
+            return Err(Error::InternalError);
+        }
+
         let mut http3_conn =
             Connection::new(config, conn.is_server, conn.dgram_enabled())?;
 
@@ -1092,7 +1155,7 @@ impl Connection {
     /// reported as writable again.
     ///
     /// [`StreamBlocked`]: enum.Error.html#variant.StreamBlocked
-    /// [Extensible Priority]: https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-priority-12#section-4.
+    /// [Extensible Priority]: https://www.rfc-editor.org/rfc/rfc9218.html#section-4.
     pub fn send_response_with_priority<T: NameValue>(
         &mut self, conn: &mut super::Connection, stream_id: u64, headers: &[T],
         priority: &Priority, fin: bool,
@@ -1353,6 +1416,17 @@ impl Connection {
         self.peer_settings.enable_webtransport == Some(1)
     }
 
+    /// Returns whether the peer enabled extended CONNECT support.
+    ///
+    /// Support is signalled by the peer's SETTINGS, so this method always
+    /// returns false until they have been processed using the [`poll()`]
+    /// method.
+    ///
+    /// [`poll()`]: struct.Connection.html#method.poll
+    pub fn extended_connect_enabled_by_peer(&self) -> bool {
+        self.peer_settings.connect_protocol_enabled == Some(1)
+    }
+
     /// Sends an HTTP/3 DATAGRAM with the specified flow ID.
     pub fn send_dgram(
         &mut self, conn: &mut super::Connection, flow_id: u64, buf: &[u8],
@@ -1410,29 +1484,19 @@ impl Connection {
     fn process_dgrams(
         &mut self, conn: &mut super::Connection,
     ) -> Result<(u64, Event)> {
-        let mut d = [0; 8];
+        if conn.dgram_recv_queue_len() > 0 {
+            if self.dgram_event_triggered {
+                return Err(Error::Done);
+            }
 
-        match conn.dgram_recv_peek(&mut d, 8) {
-            Ok(_) => {
-                if self.dgram_event_triggered {
-                    return Err(Error::Done);
-                }
+            self.dgram_event_triggered = true;
 
-                self.dgram_event_triggered = true;
-
-                Ok((0, Event::Datagram))
-            },
-
-            Err(crate::Error::Done) => {
-                // The dgram recv queue is empty, so re-arm the Datagram event
-                // so it is issued next time a DATAGRAM is received.
-                self.dgram_event_triggered = false;
-
-                Err(Error::Done)
-            },
-
-            Err(e) => Err(Error::TransportError(e)),
+            return Ok((0, Event::Datagram));
         }
+
+        self.dgram_event_triggered = false;
+
+        Err(Error::Done)
     }
 
     /// Reads request or response body data into the provided buffer.
@@ -1555,6 +1619,109 @@ impl Connection {
         }
 
         Ok(total)
+
+    }
+
+    /// Sends a PRIORITY_UPDATE frame on the control stream with specified
+    /// request stream ID and priority.
+    ///
+    /// The `priority` parameter represents [Extensible Priority]
+    /// parameters. If the urgency is outside the range 0-7, it will be clamped
+    /// to 7.
+    ///
+    /// The [`StreamBlocked`] error is returned when the underlying QUIC stream
+    /// doesn't have enough capacity for the operation to complete. When this
+    /// happens the application should retry the operation once the stream is
+    /// reported as writable again.
+    ///
+    /// [`StreamBlocked`]: enum.Error.html#variant.StreamBlocked
+    /// [Extensible Priority]: https://www.rfc-editor.org/rfc/rfc9218.html#section-4.
+    pub fn send_priority_update_for_request(
+        &mut self, conn: &mut super::Connection, stream_id: u64,
+        priority: &Priority,
+    ) -> Result<()> {
+        let mut d = [42; 20];
+        let mut b = octets::OctetsMut::with_slice(&mut d);
+
+        // Validate that it is sane to send PRIORITY_UPDATE.
+        if self.is_server {
+            return Err(Error::FrameUnexpected);
+        }
+
+        if stream_id % 4 != 0 {
+            return Err(Error::FrameUnexpected);
+        }
+
+        let control_stream_id =
+            self.control_stream_id.ok_or(Error::FrameUnexpected)?;
+
+        let urgency = priority
+            .urgency
+            .clamp(PRIORITY_URGENCY_LOWER_BOUND, PRIORITY_URGENCY_UPPER_BOUND);
+
+        let mut field_value = format!("u={}", urgency);
+
+        if priority.incremental {
+            field_value.push_str(",i");
+        }
+
+        let priority_field_value = field_value.as_bytes();
+        let frame_payload_len =
+            octets::varint_len(stream_id as u64) + priority_field_value.len();
+
+        let overhead =
+            octets::varint_len(frame::PRIORITY_UPDATE_FRAME_REQUEST_TYPE_ID) +
+                octets::varint_len(stream_id as u64) +
+                octets::varint_len(frame_payload_len as u64);
+
+        // Make sure the control stream has enough capacity.
+        match conn.stream_writable(
+            control_stream_id,
+            overhead + priority_field_value.len(),
+        ) {
+            Ok(true) => (),
+
+            Ok(false) => return Err(Error::StreamBlocked),
+
+            Err(e) => {
+                return Err(e.into());
+            },
+        }
+
+        b.put_varint(frame::PRIORITY_UPDATE_FRAME_REQUEST_TYPE_ID)?;
+        b.put_varint(frame_payload_len as u64)?;
+        b.put_varint(stream_id as u64)?;
+        let off = b.off();
+        conn.stream_send(control_stream_id, &d[..off], false)?;
+
+        // Sending field value separately avoids unnecessary copy.
+        conn.stream_send(control_stream_id, priority_field_value, false)?;
+
+        trace!(
+            "{} tx frm PRIORITY_UPDATE request_stream={} priority_field_value={}",
+            conn.trace_id(),
+            stream_id,
+            field_value,
+        );
+
+        qlog_with_type!(QLOG_FRAME_CREATED, conn.qlog, q, {
+            let frame = Http3Frame::PriorityUpdate {
+                target_stream_type: H3PriorityTargetStreamType::Request,
+                prioritized_element_id: stream_id,
+                priority_field_value: field_value.clone(),
+            };
+
+            let ev_data = EventData::H3FrameCreated(H3FrameCreated {
+                stream_id,
+                length: Some(priority_field_value.len() as u64),
+                frame,
+                raw: None,
+            });
+
+            q.add_event_data_now(ev_data).ok();
+        });
+
+        Ok(())
     }
 
     /// Take the last PRIORITY_UPDATE for a prioritized element ID.
@@ -1998,8 +2165,21 @@ impl Connection {
 
     /// Sends SETTINGS frame based on HTTP/3 configuration.
     fn send_settings(&mut self, conn: &mut super::Connection) -> Result<()> {
-        let stream_id =
-            self.open_uni_stream(conn, stream::HTTP3_CONTROL_STREAM_TYPE_ID)?;
+        let stream_id = match self
+            .open_uni_stream(conn, stream::HTTP3_CONTROL_STREAM_TYPE_ID)
+        {
+            Ok(v) => v,
+
+            Err(e) => {
+                trace!("{} Control stream blocked", conn.trace_id(),);
+
+                if e == Error::Done {
+                    return Err(Error::InternalError);
+                }
+
+                return Err(e);
+            },
+        };
 
         self.control_stream_id = Some(stream_id);
 
@@ -2027,6 +2207,9 @@ impl Connection {
                 .local_settings
                 .qpack_max_table_capacity,
             qpack_blocked_streams: self.local_settings.qpack_blocked_streams,
+            connect_protocol_enabled: self
+                .local_settings
+                .connect_protocol_enabled,
             h3_datagram: self.local_settings.h3_datagram,
             enable_webtransport: self.local_settings.enable_webtransport,
             grease,
@@ -2472,6 +2655,7 @@ impl Connection {
                 max_field_section_size,
                 qpack_max_table_capacity,
                 qpack_blocked_streams,
+                connect_protocol_enabled,
                 h3_datagram,
                 enable_webtransport,
                 raw,
@@ -2481,6 +2665,7 @@ impl Connection {
                     max_field_section_size,
                     qpack_max_table_capacity,
                     qpack_blocked_streams,
+                    connect_protocol_enabled,
                     h3_datagram,
                     enable_webtransport,
                     raw,
@@ -2847,7 +3032,7 @@ pub mod testing {
             let mut config = crate::Config::new(crate::PROTOCOL_VERSION)?;
             config.load_cert_chain_from_pem_file("examples/cert.crt")?;
             config.load_priv_key_from_pem_file("examples/cert.key")?;
-            config.set_application_protos(b"\x02h3")?;
+            config.set_application_protos(&[b"h3"])?;
             config.set_initial_max_data(1500);
             config.set_initial_max_stream_data_bidi_local(150);
             config.set_initial_max_stream_data_bidi_remote(150);
@@ -3152,6 +3337,84 @@ mod tests {
     /// Make sure that random GREASE values is within the specified limit.
     fn grease_value_in_varint_limit() {
         assert!(grease_value() < 2u64.pow(62) - 1);
+    }
+
+    #[test]
+    fn h3_handshake_0rtt() {
+        let mut buf = [0; 65535];
+
+        let mut config = crate::Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(&[b"proto1", b"proto2"])
+            .unwrap();
+        config.set_initial_max_data(30);
+        config.set_initial_max_stream_data_bidi_local(15);
+        config.set_initial_max_stream_data_bidi_remote(15);
+        config.set_initial_max_stream_data_uni(15);
+        config.set_initial_max_streams_bidi(3);
+        config.set_initial_max_streams_uni(3);
+        config.enable_early_data();
+        config.verify_peer(false);
+
+        let h3_config = Config::new().unwrap();
+
+        // Perform initial handshake.
+        let mut pipe = crate::testing::Pipe::with_config(&mut config).unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        // Extract session,
+        let session = pipe.client.session().unwrap();
+
+        // Configure session on new connection.
+        let mut pipe = crate::testing::Pipe::with_config(&mut config).unwrap();
+        assert_eq!(pipe.client.set_session(session), Ok(()));
+
+        // Can't create an H3 connection until the QUIC connection is determined
+        // to have made sufficient early data progress.
+        assert!(matches!(
+            Connection::with_transport(&mut pipe.client, &h3_config),
+            Err(Error::InternalError)
+        ));
+
+        // Client sends initial flight.
+        let (len, _) = pipe.client.send(&mut buf).unwrap();
+
+        // Now an H3 connection can be created.
+        assert!(matches!(
+            Connection::with_transport(&mut pipe.client, &h3_config),
+            Ok(_)
+        ));
+        assert_eq!(pipe.server_recv(&mut buf[..len]), Ok(len));
+
+        // Client sends 0-RTT packet.
+        let pkt_type = crate::packet::Type::ZeroRTT;
+
+        let frames = [crate::frame::Frame::Stream {
+            stream_id: 6,
+            data: crate::stream::RangeBuf::from(b"aaaaa", 0, true),
+        }];
+
+        assert_eq!(
+            pipe.send_pkt_to_server(pkt_type, &frames, &mut buf),
+            Ok(1200)
+        );
+
+        assert_eq!(pipe.server.undecryptable_pkts.len(), 0);
+
+        // 0-RTT stream data is readable.
+        let mut r = pipe.server.readable();
+        assert_eq!(r.next(), Some(6));
+        assert_eq!(r.next(), None);
+
+        let mut b = [0; 15];
+        assert_eq!(pipe.server.stream_recv(6, &mut b), Ok((5, true)));
+        assert_eq!(&b[..5], b"aaaaa");
     }
 
     #[test]
@@ -3931,15 +4194,13 @@ mod tests {
         let mut s = Session::default().unwrap();
         s.handshake().unwrap();
 
-        s.send_frame_client(
-            frame::Frame::PriorityUpdateRequest {
-                prioritized_element_id: 0,
-                priority_field_value: b"u=3".to_vec(),
-            },
-            s.client.control_stream_id.unwrap(),
-            false,
-        )
-        .unwrap();
+        s.client
+            .send_priority_update_for_request(&mut s.pipe.client, 0, &Priority {
+                urgency: 3,
+                incremental: false,
+            })
+            .unwrap();
+        s.advance().ok();
 
         assert_eq!(s.poll_server(), Ok((0, Event::PriorityUpdate)));
         assert_eq!(s.poll_server(), Err(Error::Done));
@@ -3951,30 +4212,24 @@ mod tests {
         let mut s = Session::default().unwrap();
         s.handshake().unwrap();
 
-        s.send_frame_client(
-            frame::Frame::PriorityUpdateRequest {
-                prioritized_element_id: 0,
-                priority_field_value: b"u=3".to_vec(),
-            },
-            s.client.control_stream_id.unwrap(),
-            false,
-        )
-        .unwrap();
+        s.client
+            .send_priority_update_for_request(&mut s.pipe.client, 0, &Priority {
+                urgency: 3,
+                incremental: false,
+            })
+            .unwrap();
+        s.advance().ok();
 
         assert_eq!(s.poll_server(), Ok((0, Event::PriorityUpdate)));
         assert_eq!(s.poll_server(), Err(Error::Done));
 
-        // Once the PriorityUpdate event was fired, subsequent frames will not
-        // rearm it.
-        s.send_frame_client(
-            frame::Frame::PriorityUpdateRequest {
-                prioritized_element_id: 0,
-                priority_field_value: b"u=5".to_vec(),
-            },
-            s.client.control_stream_id.unwrap(),
-            false,
-        )
-        .unwrap();
+        s.client
+            .send_priority_update_for_request(&mut s.pipe.client, 0, &Priority {
+                urgency: 5,
+                incremental: false,
+            })
+            .unwrap();
+        s.advance().ok();
 
         assert_eq!(s.poll_server(), Err(Error::Done));
 
@@ -3983,15 +4238,13 @@ mod tests {
         assert_eq!(s.server.take_last_priority_update(0), Ok(b"u=5".to_vec()));
         assert_eq!(s.server.take_last_priority_update(0), Err(Error::Done));
 
-        s.send_frame_client(
-            frame::Frame::PriorityUpdateRequest {
-                prioritized_element_id: 0,
-                priority_field_value: b"u=7".to_vec(),
-            },
-            s.client.control_stream_id.unwrap(),
-            false,
-        )
-        .unwrap();
+        s.client
+            .send_priority_update_for_request(&mut s.pipe.client, 0, &Priority {
+                urgency: 7,
+                incremental: false,
+            })
+            .unwrap();
+        s.advance().ok();
 
         assert_eq!(s.poll_server(), Ok((0, Event::PriorityUpdate)));
         assert_eq!(s.poll_server(), Err(Error::Done));
@@ -4007,41 +4260,35 @@ mod tests {
         let mut s = Session::default().unwrap();
         s.handshake().unwrap();
 
-        s.send_frame_client(
-            frame::Frame::PriorityUpdateRequest {
-                prioritized_element_id: 0,
-                priority_field_value: b"u=3".to_vec(),
-            },
-            s.client.control_stream_id.unwrap(),
-            false,
-        )
-        .unwrap();
+        s.client
+            .send_priority_update_for_request(&mut s.pipe.client, 0, &Priority {
+                urgency: 3,
+                incremental: false,
+            })
+            .unwrap();
+        s.advance().ok();
 
         assert_eq!(s.poll_server(), Ok((0, Event::PriorityUpdate)));
         assert_eq!(s.poll_server(), Err(Error::Done));
 
-        s.send_frame_client(
-            frame::Frame::PriorityUpdateRequest {
-                prioritized_element_id: 4,
-                priority_field_value: b"u=1".to_vec(),
-            },
-            s.client.control_stream_id.unwrap(),
-            false,
-        )
-        .unwrap();
+        s.client
+            .send_priority_update_for_request(&mut s.pipe.client, 4, &Priority {
+                urgency: 1,
+                incremental: false,
+            })
+            .unwrap();
+        s.advance().ok();
 
         assert_eq!(s.poll_server(), Ok((4, Event::PriorityUpdate)));
         assert_eq!(s.poll_server(), Err(Error::Done));
 
-        s.send_frame_client(
-            frame::Frame::PriorityUpdateRequest {
-                prioritized_element_id: 8,
-                priority_field_value: b"u=2".to_vec(),
-            },
-            s.client.control_stream_id.unwrap(),
-            false,
-        )
-        .unwrap();
+        s.client
+            .send_priority_update_for_request(&mut s.pipe.client, 8, &Priority {
+                urgency: 2,
+                incremental: false,
+            })
+            .unwrap();
+        s.advance().ok();
 
         assert_eq!(s.poll_server(), Ok((8, Event::PriorityUpdate)));
         assert_eq!(s.poll_server(), Err(Error::Done));
@@ -4109,15 +4356,13 @@ mod tests {
         let mut s = Session::default().unwrap();
         s.handshake().unwrap();
 
-        s.send_frame_client(
-            frame::Frame::PriorityUpdateRequest {
-                prioritized_element_id: 0,
-                priority_field_value: b"u=3".to_vec(),
-            },
-            s.client.control_stream_id.unwrap(),
-            false,
-        )
-        .unwrap();
+        s.client
+            .send_priority_update_for_request(&mut s.pipe.client, 0, &Priority {
+                urgency: 3,
+                incremental: false,
+            })
+            .unwrap();
+        s.advance().ok();
 
         let (stream, req) = s.send_request(true).unwrap();
         let ev_headers = Event::Headers {
@@ -4146,15 +4391,13 @@ mod tests {
         assert_eq!(s.poll_client(), Err(Error::Done));
 
         // Now send a PRIORITY_UPDATE for the completed request stream.
-        s.send_frame_client(
-            frame::Frame::PriorityUpdateRequest {
-                prioritized_element_id: 0,
-                priority_field_value: b"u=3".to_vec(),
-            },
-            s.client.control_stream_id.unwrap(),
-            false,
-        )
-        .unwrap();
+        s.client
+            .send_priority_update_for_request(&mut s.pipe.client, 0, &Priority {
+                urgency: 3,
+                incremental: false,
+            })
+            .unwrap();
+        s.advance().ok();
 
         // No event generated at server
         assert_eq!(s.poll_server(), Err(Error::Done));
@@ -4167,15 +4410,13 @@ mod tests {
         let mut s = Session::default().unwrap();
         s.handshake().unwrap();
 
-        s.send_frame_client(
-            frame::Frame::PriorityUpdateRequest {
-                prioritized_element_id: 0,
-                priority_field_value: b"u=3".to_vec(),
-            },
-            s.client.control_stream_id.unwrap(),
-            false,
-        )
-        .unwrap();
+        s.client
+            .send_priority_update_for_request(&mut s.pipe.client, 0, &Priority {
+                urgency: 3,
+                incremental: false,
+            })
+            .unwrap();
+        s.advance().ok();
 
         let (stream, req) = s.send_request(false).unwrap();
         let ev_headers = Event::Headers {
@@ -4206,15 +4447,13 @@ mod tests {
         assert_eq!(s.poll_server(), Err(Error::Done));
 
         // Now send a PRIORITY_UPDATE for the closed request stream.
-        s.send_frame_client(
-            frame::Frame::PriorityUpdateRequest {
-                prioritized_element_id: 0,
-                priority_field_value: b"u=3".to_vec(),
-            },
-            s.client.control_stream_id.unwrap(),
-            false,
-        )
-        .unwrap();
+        s.client
+            .send_priority_update_for_request(&mut s.pipe.client, 0, &Priority {
+                urgency: 3,
+                incremental: false,
+            })
+            .unwrap();
+        s.advance().ok();
 
         // No event generated at server
         assert_eq!(s.poll_server(), Err(Error::Done));
@@ -4590,7 +4829,7 @@ mod tests {
         config
             .load_priv_key_from_pem_file("examples/cert.key")
             .unwrap();
-        config.set_application_protos(b"\x02h3").unwrap();
+        config.set_application_protos(&[b"h3"]).unwrap();
         config.set_initial_max_data(1500);
         config.set_initial_max_stream_data_bidi_local(150);
         config.set_initial_max_stream_data_bidi_remote(150);
@@ -4693,7 +4932,7 @@ mod tests {
     }
 
     #[test]
-    /// Tests that calling poll() after an error occured does nothing.
+    /// Tests that calling poll() after an error occurred does nothing.
     fn poll_after_error() {
         let mut s = Session::default().unwrap();
         s.handshake().unwrap();
@@ -4727,7 +4966,7 @@ mod tests {
         config
             .load_priv_key_from_pem_file("examples/cert.key")
             .unwrap();
-        config.set_application_protos(b"\x02h3").unwrap();
+        config.set_application_protos(&[b"h3"]).unwrap();
         config.set_initial_max_data(70);
         config.set_initial_max_stream_data_bidi_local(150);
         config.set_initial_max_stream_data_bidi_remote(150);
@@ -4773,7 +5012,7 @@ mod tests {
         config
             .load_priv_key_from_pem_file("examples/cert.key")
             .unwrap();
-        config.set_application_protos(b"\x02h3").unwrap();
+        config.set_application_protos(&[b"h3"]).unwrap();
         config.set_initial_max_data(70);
         config.set_initial_max_stream_data_bidi_local(150);
         config.set_initial_max_stream_data_bidi_remote(150);
@@ -4883,7 +5122,7 @@ mod tests {
         config
             .load_priv_key_from_pem_file("examples/cert.key")
             .unwrap();
-        config.set_application_protos(b"\x02h3").unwrap();
+        config.set_application_protos(&[b"h3"]).unwrap();
         config.set_initial_max_data(69);
         config.set_initial_max_stream_data_bidi_local(150);
         config.set_initial_max_stream_data_bidi_remote(150);
@@ -4922,6 +5161,36 @@ mod tests {
     }
 
     #[test]
+    /// Tests that receiving an empty SETTINGS frame is handled and reported.
+    fn empty_settings() {
+        let mut config = crate::Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config.set_application_protos(&[b"h3"]).unwrap();
+        config.set_initial_max_data(1500);
+        config.set_initial_max_stream_data_bidi_local(150);
+        config.set_initial_max_stream_data_bidi_remote(150);
+        config.set_initial_max_stream_data_uni(150);
+        config.set_initial_max_streams_bidi(5);
+        config.set_initial_max_streams_uni(5);
+        config.verify_peer(false);
+        config.set_ack_delay_exponent(8);
+        config.grease(false);
+
+        let h3_config = Config::new().unwrap();
+        let mut s = Session::with_configs(&mut config, &h3_config).unwrap();
+
+        s.handshake().unwrap();
+
+        assert!(s.client.peer_settings_raw().is_some());
+        assert!(s.server.peer_settings_raw().is_some());
+    }
+
+    #[test]
     /// Tests that receiving a H3_DATAGRAM setting is ok.
     fn dgram_setting() {
         let mut config = crate::Config::new(crate::PROTOCOL_VERSION).unwrap();
@@ -4931,7 +5200,7 @@ mod tests {
         config
             .load_priv_key_from_pem_file("examples/cert.key")
             .unwrap();
-        config.set_application_protos(b"\x02h3").unwrap();
+        config.set_application_protos(&[b"h3"]).unwrap();
         config.set_initial_max_data(70);
         config.set_initial_max_stream_data_bidi_local(150);
         config.set_initial_max_stream_data_bidi_remote(150);
@@ -4976,7 +5245,7 @@ mod tests {
         config
             .load_priv_key_from_pem_file("examples/cert.key")
             .unwrap();
-        config.set_application_protos(b"\x02h3").unwrap();
+        config.set_application_protos(&[b"h3"]).unwrap();
         config.set_initial_max_data(70);
         config.set_initial_max_stream_data_bidi_local(150);
         config.set_initial_max_stream_data_bidi_remote(150);
@@ -5003,6 +5272,7 @@ mod tests {
             max_field_section_size: None,
             qpack_max_table_capacity: None,
             qpack_blocked_streams: None,
+            connect_protocol_enabled: None,
             h3_datagram: Some(1),
             enable_webtransport: None,
             grease: None,
@@ -5027,7 +5297,7 @@ mod tests {
         config
             .load_priv_key_from_pem_file("examples/cert.key")
             .unwrap();
-        config.set_application_protos(b"\x02h3").unwrap();
+        config.set_application_protos(&[b"h3"]).unwrap();
         config.set_initial_max_data(70);
         config.set_initial_max_stream_data_bidi_local(150);
         config.set_initial_max_stream_data_bidi_remote(150);
@@ -5189,7 +5459,7 @@ mod tests {
         config
             .load_priv_key_from_pem_file("examples/cert.key")
             .unwrap();
-        config.set_application_protos(b"\x02h3").unwrap();
+        config.set_application_protos(&[b"h3"]).unwrap();
         config.set_initial_max_data(1500);
         config.set_initial_max_stream_data_bidi_local(150);
         config.set_initial_max_stream_data_bidi_remote(150);
@@ -5237,7 +5507,7 @@ mod tests {
         config
             .load_priv_key_from_pem_file("examples/cert.key")
             .unwrap();
-        config.set_application_protos(b"\x02h3").unwrap();
+        config.set_application_protos(&[b"h3"]).unwrap();
         config.set_initial_max_data(1500);
         config.set_initial_max_stream_data_bidi_local(150);
         config.set_initial_max_stream_data_bidi_remote(150);
@@ -5329,7 +5599,7 @@ mod tests {
         config
             .load_priv_key_from_pem_file("examples/cert.key")
             .unwrap();
-        config.set_application_protos(b"\x02h3").unwrap();
+        config.set_application_protos(&[b"h3"]).unwrap();
         config.set_initial_max_data(1500);
         config.set_initial_max_stream_data_bidi_local(150);
         config.set_initial_max_stream_data_bidi_remote(150);
@@ -5681,7 +5951,7 @@ mod tests {
         config
             .load_priv_key_from_pem_file("examples/cert.key")
             .unwrap();
-        config.set_application_protos(b"\x02h3").unwrap();
+        config.set_application_protos(&[b"h3"]).unwrap();
         config.set_initial_max_data(1500);
         config.set_initial_max_stream_data_bidi_local(150);
         config.set_initial_max_stream_data_bidi_remote(150);

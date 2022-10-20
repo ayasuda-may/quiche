@@ -37,7 +37,7 @@ pub type Result<T> = std::result::Result<T, BufferTooShortError>;
 /// An error indicating that the provided [`OctetsMut`] is not big enough.
 ///
 /// [`OctetsMut`]: struct.OctetsMut.html
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BufferTooShortError;
 
 impl std::fmt::Display for BufferTooShortError {
@@ -118,7 +118,7 @@ macro_rules! put_u {
 /// Additionally, an offset (initially set to the start of the buffer) is
 /// incremented as bytes are read from / written to the buffer, to allow for
 /// sequential operations.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Octets<'a> {
     buf: &'a [u8],
     off: usize,
@@ -197,7 +197,7 @@ impl<'a> Octets<'a> {
 
     /// Reads `len` bytes from the current offset without copying and advances
     /// the buffer.
-    pub fn get_bytes(&mut self, len: usize) -> Result<Octets> {
+    pub fn get_bytes(&mut self, len: usize) -> Result<Octets<'a>> {
         if self.cap() < len {
             return Err(BufferTooShortError);
         }
@@ -214,7 +214,7 @@ impl<'a> Octets<'a> {
 
     /// Reads `len` bytes from the current offset without copying and advances
     /// the buffer, where `len` is an unsigned 8-bit integer prefix.
-    pub fn get_bytes_with_u8_length(&mut self) -> Result<Octets> {
+    pub fn get_bytes_with_u8_length(&mut self) -> Result<Octets<'a>> {
         let len = self.get_u8()?;
         self.get_bytes(len as usize)
     }
@@ -222,7 +222,7 @@ impl<'a> Octets<'a> {
     /// Reads `len` bytes from the current offset without copying and advances
     /// the buffer, where `len` is an unsigned 16-bit integer prefix in network
     /// byte-order.
-    pub fn get_bytes_with_u16_length(&mut self) -> Result<Octets> {
+    pub fn get_bytes_with_u16_length(&mut self) -> Result<Octets<'a>> {
         let len = self.get_u16()?;
         self.get_bytes(len as usize)
     }
@@ -230,14 +230,14 @@ impl<'a> Octets<'a> {
     /// Reads `len` bytes from the current offset without copying and advances
     /// the buffer, where `len` is an unsigned variable-length integer prefix
     /// in network byte-order.
-    pub fn get_bytes_with_varint_length(&mut self) -> Result<Octets> {
+    pub fn get_bytes_with_varint_length(&mut self) -> Result<Octets<'a>> {
         let len = self.get_varint()?;
         self.get_bytes(len as usize)
     }
 
     /// Reads `len` bytes from the current offset without copying and without
     /// advancing the buffer.
-    pub fn peek_bytes(&self, len: usize) -> Result<Octets> {
+    pub fn peek_bytes(&self, len: usize) -> Result<Octets<'a>> {
         if self.cap() < len {
             return Err(BufferTooShortError);
         }
@@ -301,7 +301,7 @@ impl<'a> Octets<'a> {
     }
 
     /// Returns a reference to the internal buffer.
-    pub fn buf(&self) -> &[u8] {
+    pub fn buf(&self) -> &'a [u8] {
         self.buf
     }
 
@@ -320,7 +320,7 @@ impl<'a> AsRef<[u8]> for Octets<'a> {
 /// A zero-copy mutable byte buffer.
 ///
 /// Like `Octets` but mutable.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct OctetsMut<'a> {
     buf: &'a mut [u8],
     off: usize,
@@ -666,7 +666,7 @@ impl<'a> AsMut<[u8]> for OctetsMut<'a> {
 
 /// Returns how many bytes it would take to encode `v` as a variable-length
 /// integer.
-pub fn varint_len(v: u64) -> usize {
+pub const fn varint_len(v: u64) -> usize {
     if v <= 63 {
         1
     } else if v <= 16383 {
@@ -681,7 +681,7 @@ pub fn varint_len(v: u64) -> usize {
 }
 
 /// Returns how long the variable-length integer is, given its first byte.
-pub fn varint_parse_len(first: u8) -> usize {
+pub const fn varint_parse_len(first: u8) -> usize {
     match first >> 6 {
         0 => 1,
         1 => 2,

@@ -85,9 +85,13 @@ fn main() {
         .unwrap();
 
     config
-        .set_application_protos(
-            b"\x0ahq-interop\x05hq-29\x05hq-28\x05hq-27\x08http/0.9",
-        )
+        .set_application_protos(&[
+            b"hq-interop",
+            b"hq-29",
+            b"hq-28",
+            b"hq-27",
+            b"http/0.9",
+        ])
         .unwrap();
 
     config.set_max_idle_timeout(5000);
@@ -107,6 +111,8 @@ fn main() {
         ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &rng).unwrap();
 
     let mut clients = ClientMap::new();
+
+    let local_addr = socket.local_addr().unwrap();
 
     loop {
         // Find the shorter timeout from all the active connections.
@@ -255,9 +261,14 @@ fn main() {
 
                 debug!("New connection: dcid={:?} scid={:?}", hdr.dcid, scid);
 
-                let conn =
-                    quiche::accept(&scid, odcid.as_ref(), from, &mut config)
-                        .unwrap();
+                let conn = quiche::accept(
+                    &scid,
+                    odcid.as_ref(),
+                    local_addr,
+                    from,
+                    &mut config,
+                )
+                .unwrap();
 
                 let client = Client {
                     conn,
@@ -275,7 +286,10 @@ fn main() {
                 }
             };
 
-            let recv_info = quiche::RecvInfo { from };
+            let recv_info = quiche::RecvInfo {
+                to: socket.local_addr().unwrap(),
+                from,
+            };
 
             // Process potentially coalesced packets.
             let read = match client.conn.recv(pkt_buf, recv_info) {

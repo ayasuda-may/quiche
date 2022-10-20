@@ -79,13 +79,11 @@ impl Default for Rate {
 }
 
 impl Rate {
-    pub fn on_packet_sent(
-        &mut self, pkt: &mut Sent, bytes_in_flight: usize, now: Instant,
-    ) {
-        // No packets in flight yet?
+    pub fn on_packet_sent(&mut self, pkt: &mut Sent, bytes_in_flight: usize) {
+        // No packets in flight.
         if bytes_in_flight == 0 {
-            self.first_sent_time = now;
-            self.delivered_time = now;
+            self.first_sent_time = pkt.time_sent;
+            self.delivered_time = pkt.time_sent;
         }
 
         pkt.first_sent_time = self.first_sent_time;
@@ -162,7 +160,7 @@ impl Rate {
         self.end_of_app_limited != 0
     }
 
-    pub fn _delivered(&self) -> usize {
+    pub fn delivered(&self) -> usize {
         self.delivered
     }
 
@@ -170,11 +168,11 @@ impl Rate {
         self.rate_sample.delivery_rate
     }
 
-    pub fn _sample_rtt(&self) -> Duration {
+    pub fn sample_rtt(&self) -> Duration {
         self.rate_sample.rtt
     }
 
-    pub fn _sample_is_app_limited(&self) -> bool {
+    pub fn sample_is_app_limited(&self) -> bool {
         self.rate_sample.is_app_limited
     }
 }
@@ -264,7 +262,7 @@ mod tests {
         r.delivery_rate.generate_rate_sample(rtt);
 
         // Bytes acked so far.
-        assert_eq!(r.delivery_rate._delivered(), 2400);
+        assert_eq!(r.delivery_rate.delivered(), 2400);
 
         // Estimated delivery rate = (1200 x 2) / 0.05s = 48000.
         assert_eq!(r.delivery_rate(), 48000);
@@ -306,7 +304,7 @@ mod tests {
         }
 
         assert_eq!(r.app_limited(), false);
-        assert_eq!(r.delivery_rate._sample_is_app_limited(), false);
+        assert_eq!(r.delivery_rate.sample_is_app_limited(), false);
     }
 
     #[test]
@@ -359,13 +357,12 @@ mod tests {
                 now,
                 "",
             ),
-            Ok(()),
+            Ok((0, 0)),
         );
 
         assert_eq!(r.app_limited(), true);
-
         // Rate sample is not app limited (all acked).
-        assert_eq!(r.delivery_rate._sample_is_app_limited(), false);
-        assert_eq!(r.delivery_rate._sample_rtt(), rtt);
+        assert_eq!(r.delivery_rate.sample_is_app_limited(), false);
+        assert_eq!(r.delivery_rate.sample_rtt(), rtt);
     }
 }

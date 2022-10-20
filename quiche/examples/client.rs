@@ -81,9 +81,13 @@ fn main() {
     config.verify_peer(false);
 
     config
-        .set_application_protos(
-            b"\x0ahq-interop\x05hq-29\x05hq-28\x05hq-27\x08http/0.9",
-        )
+        .set_application_protos(&[
+            b"hq-interop",
+            b"hq-29",
+            b"hq-28",
+            b"hq-27",
+            b"http/0.9",
+        ])
         .unwrap();
 
     config.set_max_idle_timeout(5000);
@@ -102,9 +106,13 @@ fn main() {
 
     let scid = quiche::ConnectionId::from_ref(&scid);
 
+    // Get local address.
+    let local_addr = socket.local_addr().unwrap();
+
     // Create a QUIC connection and initiate handshake.
     let mut conn =
-        quiche::connect(url.domain(), &scid, peer_addr, &mut config).unwrap();
+        quiche::connect(url.domain(), &scid, local_addr, peer_addr, &mut config)
+            .unwrap();
 
     info!(
         "connecting to {:} from {:} with scid {}",
@@ -163,7 +171,10 @@ fn main() {
 
             debug!("got {} bytes", len);
 
-            let recv_info = quiche::RecvInfo { from };
+            let recv_info = quiche::RecvInfo {
+                to: socket.local_addr().unwrap(),
+                from,
+            };
 
             // Process potentially coalesced packets.
             let read = match conn.recv(&mut buf[..len], recv_info) {

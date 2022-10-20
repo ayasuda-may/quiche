@@ -1,4 +1,4 @@
-// Copyright (C) 2021, Cloudflare, Inc.
+// Copyright (C) 2022, Cloudflare, Inc.
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -24,58 +24,23 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use serde::Deserialize;
-use serde::Serialize;
+use super::*;
 
-use super::Bytes;
+use crate::recovery::Recovery;
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
-#[serde(rename_all = "snake_case")]
-pub enum KeyType {
-    ServerInitialSecret,
-    ClientInitialSecret,
-
-    ServerHandshakeSecret,
-    ClientHandshakeSecret,
-
-    #[serde(rename = "server_0rtt_secret")]
-    Server0RttSecret,
-    #[serde(rename = "client_0rtt_secret")]
-    Client0RttSecret,
-    #[serde(rename = "server_1rtt_secret")]
-    Server1RttSecret,
-    #[serde(rename = "client_1rtt_secret")]
-    Client1RttSecret,
+// BBR Functions when trasmitting packets.
+//
+pub fn bbr_on_transmit(r: &mut Recovery) {
+    bbr_handle_restart_from_idle(r);
 }
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
-#[serde(rename_all = "snake_case")]
-pub enum KeyUpdateOrRetiredTrigger {
-    Tls,
-    RemoteUpdate,
-    LocalUpdate,
-}
+// 4.3.4.4.  Restarting From Idle
+fn bbr_handle_restart_from_idle(r: &mut Recovery) {
+    if r.bytes_in_flight == 0 && r.delivery_rate.app_limited() {
+        r.bbr_state.idle_restart = true;
 
-#[serde_with::skip_serializing_none]
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
-pub struct KeyUpdated {
-    pub key_type: KeyType,
-
-    pub old: Option<Bytes>,
-    pub new: Bytes,
-
-    pub generation: Option<u32>,
-
-    pub trigger: Option<KeyUpdateOrRetiredTrigger>,
-}
-
-#[serde_with::skip_serializing_none]
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
-pub struct KeyRetired {
-    pub key_type: KeyType,
-    pub key: Option<Bytes>,
-
-    pub generation: Option<u32>,
-
-    pub trigger: Option<KeyUpdateOrRetiredTrigger>,
+        if r.bbr_state.state == BBRStateMachine::ProbeBW {
+            pacing::bbr_set_pacing_rate_with_gain(r, 1.0);
+        }
+    }
 }

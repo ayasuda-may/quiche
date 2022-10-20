@@ -254,46 +254,63 @@ impl StreamMap {
                         (local_params.initial_max_stream_data_uni, 0),
                 };
 
+                // The two least significant bits from a stream id identify the
+                // type of stream. Truncate those bits to get the sequence for
+                // that stream type.
+                let stream_sequence = id >> 2;
+
                 // Enforce stream count limits.
                 match (is_local(id, is_server), is_bidi(id)) {
                     (true, true) => {
-                        if self.local_opened_streams_bidi >=
-                            self.peer_max_streams_bidi
-                        {
+                        let n = std::cmp::max(
+                            self.local_opened_streams_bidi,
+                            stream_sequence + 1,
+                        );
+
+                        if n > self.peer_max_streams_bidi {
                             return Err(Error::StreamLimit);
                         }
 
-                        self.local_opened_streams_bidi += 1;
+                        self.local_opened_streams_bidi = n;
                     },
 
                     (true, false) => {
-                        if self.local_opened_streams_uni >=
-                            self.peer_max_streams_uni
-                        {
+                        let n = std::cmp::max(
+                            self.local_opened_streams_uni,
+                            stream_sequence + 1,
+                        );
+
+                        if n > self.peer_max_streams_uni {
                             return Err(Error::StreamLimit);
                         }
 
-                        self.local_opened_streams_uni += 1;
+                        self.local_opened_streams_uni = n;
                     },
 
                     (false, true) => {
-                        if self.peer_opened_streams_bidi >=
-                            self.local_max_streams_bidi
-                        {
+                        let n = std::cmp::max(
+                            self.peer_opened_streams_bidi,
+                            stream_sequence + 1,
+                        );
+
+                        if n > self.local_max_streams_bidi {
                             return Err(Error::StreamLimit);
                         }
 
-                        self.peer_opened_streams_bidi += 1;
+                        self.peer_opened_streams_bidi = n;
                     },
 
                     (false, false) => {
-                        if self.peer_opened_streams_uni >=
-                            self.local_max_streams_uni
-                        {
+                        let n = std::cmp::max(
+                            self.peer_opened_streams_uni,
+                            stream_sequence + 1,
+                        );
+
+                        if n > self.local_max_streams_uni {
                             return Err(Error::StreamLimit);
                         }
 
-                        self.peer_opened_streams_uni += 1;
+                        self.peer_opened_streams_uni = n;
                     },
                 };
 
@@ -699,6 +716,11 @@ impl Stream {
             (false, false) => self.recv.is_fin(),
         }
     }
+
+    /// Returns true if the stream is not storing incoming data.
+    pub fn is_draining(&self) -> bool {
+        self.recv.drain
+    }
 }
 
 /// Returns true if the stream was created locally.
@@ -714,7 +736,7 @@ pub fn is_bidi(stream_id: u64) -> bool {
 /// An iterator over QUIC streams.
 #[derive(Default)]
 pub struct StreamIter {
-    streams: Vec<u64>,
+    streams: VecDeque<u64>,
 }
 
 impl StreamIter {
@@ -731,7 +753,7 @@ impl Iterator for StreamIter {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        self.streams.pop()
+        self.streams.pop_front()
     }
 }
 
@@ -1214,8 +1236,7 @@ impl SendBuf {
 
             // Copy data to the output buffer.
             let out_pos = (next_off - out_off) as usize;
-            (&mut out[out_pos..out_pos + buf_len])
-                .copy_from_slice(&buf[..buf_len]);
+            out[out_pos..out_pos + buf_len].copy_from_slice(&buf[..buf_len]);
 
             self.len -= buf_len as u64;
 
@@ -1338,8 +1359,10 @@ impl SendBuf {
                 None
             };
 
-            // Advance the buffer's position if the retransmit range is past
-            // the buffer's starting offset.
+            let prev_pos = buf.pos;
+
+            // Reduce the buffer's position (expand the buffer) if the retransmit
+            // range is past the buffer's starting offset.
             buf.pos = if off > buf.off && off <= buf.max_off() {
                 cmp::min(buf.pos, buf.start + (off - buf.off) as usize)
             } else {
@@ -1348,7 +1371,7 @@ impl SendBuf {
 
             self.pos = cmp::min(self.pos, i);
 
-            self.len += buf.len() as u64;
+            self.len += (prev_pos - buf.pos) as u64;
 
             if let Some(b) = new_buf {
                 self.data.insert(i + 1, b);
@@ -3233,5 +3256,96 @@ mod tests {
         assert_eq!(new_new_buf.fin(), true);
 
         assert_eq!(&new_new_buf[..], b"");
+    }
+
+    /// RFC9000 2.1: A stream ID that is used out of order results in all
+    /// streams of that type with lower-numbered stream IDs also being opened.
+    #[test]
+    fn stream_limit_auto_open() {
+        let local_tp = crate::TransportParams::default();
+        let peer_tp = crate::TransportParams::default();
+
+        let mut streams = StreamMap::new(5, 5, 5);
+
+        let stream_id = 500;
+        assert!(!is_local(stream_id, true), "stream id is peer initiated");
+        assert!(is_bidi(stream_id), "stream id is bidirectional");
+        assert_eq!(
+            streams
+                .get_or_create(stream_id, &local_tp, &peer_tp, false, true)
+                .err(),
+            Some(Error::StreamLimit),
+            "stream limit should be exceeded"
+        );
+    }
+
+    /// Stream limit should be satisfied regardless of what order we open
+    /// streams
+    #[test]
+    fn stream_create_out_of_order() {
+        let local_tp = crate::TransportParams::default();
+        let peer_tp = crate::TransportParams::default();
+
+        let mut streams = StreamMap::new(5, 5, 5);
+
+        for stream_id in [8, 12, 4] {
+            assert!(is_local(stream_id, false), "stream id is client initiated");
+            assert!(is_bidi(stream_id), "stream id is bidirectional");
+            assert!(streams
+                .get_or_create(stream_id, &local_tp, &peer_tp, false, true)
+                .is_ok());
+        }
+    }
+
+    /// Check stream limit boundary cases
+    #[test]
+    fn stream_limit_edge() {
+        let local_tp = crate::TransportParams::default();
+        let peer_tp = crate::TransportParams::default();
+
+        let mut streams = StreamMap::new(3, 3, 3);
+
+        // Highest permitted
+        let stream_id = 8;
+        assert!(streams
+            .get_or_create(stream_id, &local_tp, &peer_tp, false, true)
+            .is_ok());
+
+        // One more than highest permitted
+        let stream_id = 12;
+        assert_eq!(
+            streams
+                .get_or_create(stream_id, &local_tp, &peer_tp, false, true)
+                .err(),
+            Some(Error::StreamLimit)
+        );
+    }
+
+    /// Check SendBuf::len calculation on a retransmit case
+    #[test]
+    fn send_buf_len_on_retransmit() {
+        let mut buf = [0; 15];
+
+        let mut send = SendBuf::new(std::u64::MAX);
+        assert_eq!(send.len, 0);
+        assert_eq!(send.off_front(), 0);
+
+        let first = b"something";
+
+        assert!(send.write(first, false).is_ok());
+        assert_eq!(send.off_front(), 0);
+
+        assert_eq!(send.len, 9);
+
+        let (written, fin) = send.emit(&mut buf[..4]).unwrap();
+        assert_eq!(written, 4);
+        assert_eq!(fin, false);
+        assert_eq!(&buf[..written], b"some");
+        assert_eq!(send.len, 5);
+        assert_eq!(send.off_front(), 4);
+
+        send.retransmit(3, 5);
+        assert_eq!(send.len, 6);
+        assert_eq!(send.off_front(), 3);
     }
 }

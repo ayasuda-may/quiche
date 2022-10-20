@@ -103,9 +103,13 @@ fn main() {
 
     let scid = quiche::ConnectionId::from_ref(&scid);
 
+    // Get local address.
+    let local_addr = socket.local_addr().unwrap();
+
     // Create a QUIC connection and initiate handshake.
     let mut conn =
-        quiche::connect(url.domain(), &scid, peer_addr, &mut config).unwrap();
+        quiche::connect(url.domain(), &scid, local_addr, peer_addr, &mut config)
+            .unwrap();
 
     info!(
         "connecting to {:} from {:} with scid {}",
@@ -186,7 +190,10 @@ fn main() {
 
             debug!("got {} bytes", len);
 
-            let recv_info = quiche::RecvInfo { from };
+            let recv_info = quiche::RecvInfo {
+                to: local_addr,
+                from,
+            };
 
             // Process potentially coalesced packets.
             let read = match conn.recv(&mut buf[..len], recv_info) {
@@ -212,7 +219,7 @@ fn main() {
         if conn.is_established() && http3_conn.is_none() {
             http3_conn = Some(
                 quiche::h3::Connection::with_transport(&mut conn, &h3_config)
-                    .unwrap(),
+                .expect("Unable to create HTTP/3 connection, check the server's uni stream limit and window size"),
             );
         }
 
@@ -340,13 +347,13 @@ fn hex_dump(buf: &[u8]) -> String {
     vec.join("")
 }
 
-fn hdrs_to_strings(hdrs: &[quiche::h3::Header]) -> Vec<(String, String)> {
+pub fn hdrs_to_strings(hdrs: &[quiche::h3::Header]) -> Vec<(String, String)> {
     hdrs.iter()
         .map(|h| {
-            (
-                String::from_utf8(h.name().into()).unwrap(),
-                String::from_utf8(h.value().into()).unwrap(),
-            )
+            let name = String::from_utf8_lossy(h.name()).to_string();
+            let value = String::from_utf8_lossy(h.value()).to_string();
+
+            (name, value)
         })
         .collect()
 }

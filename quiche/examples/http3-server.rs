@@ -114,6 +114,8 @@ fn main() {
 
     let mut clients = ClientMap::new();
 
+    let local_addr = socket.local_addr().unwrap();
+
     loop {
         // Find the shorter timeout from all the active connections.
         //
@@ -261,9 +263,14 @@ fn main() {
 
                 debug!("New connection: dcid={:?} scid={:?}", hdr.dcid, scid);
 
-                let conn =
-                    quiche::accept(&scid, odcid.as_ref(), from, &mut config)
-                        .unwrap();
+                let conn = quiche::accept(
+                    &scid,
+                    odcid.as_ref(),
+                    local_addr,
+                    from,
+                    &mut config,
+                )
+                .unwrap();
 
                 let client = Client {
                     conn,
@@ -282,7 +289,10 @@ fn main() {
                 }
             };
 
-            let recv_info = quiche::RecvInfo { from };
+            let recv_info = quiche::RecvInfo {
+                to: socket.local_addr().unwrap(),
+                from,
+            };
 
             // Process potentially coalesced packets.
             let read = match client.conn.recv(pkt_buf, recv_info) {
@@ -662,13 +672,13 @@ fn handle_writable(client: &mut Client, stream_id: u64) {
     }
 }
 
-fn hdrs_to_strings(hdrs: &[quiche::h3::Header]) -> Vec<(String, String)> {
+pub fn hdrs_to_strings(hdrs: &[quiche::h3::Header]) -> Vec<(String, String)> {
     hdrs.iter()
         .map(|h| {
-            (
-                String::from_utf8(h.name().into()).unwrap(),
-                String::from_utf8(h.value().into()).unwrap(),
-            )
+            let name = String::from_utf8_lossy(h.name()).to_string();
+            let value = String::from_utf8_lossy(h.value()).to_string();
+
+            (name, value)
         })
         .collect()
 }
