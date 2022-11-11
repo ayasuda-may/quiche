@@ -1151,7 +1151,7 @@ pub struct Connection {
     trace_id: String,
 
     /// Packet number spaces.
-    pkt_num_spaces: [packet::PktNumSpace; packet::EPOCH_COUNT],
+    pkt_num_spaces: [packet::PktNumSpace; packet::Epoch::count()],
 
     /// Peer's transport parameters.
     peer_transport_params: TransportParams,
@@ -1798,9 +1798,9 @@ impl Connection {
                 active_path_id,
             )?;
 
-            conn.pkt_num_spaces[packet::EPOCH_INITIAL].crypto_open =
+            conn.pkt_num_spaces[packet::Epoch::Initial].crypto_open =
                 Some(aead_open);
-            conn.pkt_num_spaces[packet::EPOCH_INITIAL].crypto_seal =
+            conn.pkt_num_spaces[packet::Epoch::Initial].crypto_seal =
                 Some(aead_seal);
 
             conn.derived_initial_secrets = true;
@@ -2055,7 +2055,7 @@ impl Connection {
     fn process_undecrypted_0rtt_packets(&mut self) -> Result<()> {
         // Process previously undecryptable 0-RTT packets if the decryption key
         // is now available.
-        if self.pkt_num_spaces[packet::EPOCH_APPLICATION]
+        if self.pkt_num_spaces[packet::Epoch::Application]
             .crypto_0rtt_open
             .is_some()
         {
@@ -2191,13 +2191,13 @@ impl Connection {
             )?;
 
             // Reset connection state to force sending another Initial packet.
-            self.drop_epoch_state(packet::EPOCH_INITIAL, now);
+            self.drop_epoch_state(packet::Epoch::Initial, now);
             self.got_peer_conn_id = false;
             self.handshake.clear()?;
 
-            self.pkt_num_spaces[packet::EPOCH_INITIAL].crypto_open =
+            self.pkt_num_spaces[packet::Epoch::Initial].crypto_open =
                 Some(aead_open);
-            self.pkt_num_spaces[packet::EPOCH_INITIAL].crypto_seal =
+            self.pkt_num_spaces[packet::Epoch::Initial].crypto_seal =
                 Some(aead_seal);
 
             self.handshake
@@ -2256,13 +2256,13 @@ impl Connection {
             )?;
 
             // Reset connection state to force sending another Initial packet.
-            self.drop_epoch_state(packet::EPOCH_INITIAL, now);
+            self.drop_epoch_state(packet::Epoch::Initial, now);
             self.got_peer_conn_id = false;
             self.handshake.clear()?;
 
-            self.pkt_num_spaces[packet::EPOCH_INITIAL].crypto_open =
+            self.pkt_num_spaces[packet::Epoch::Initial].crypto_open =
                 Some(aead_open);
-            self.pkt_num_spaces[packet::EPOCH_INITIAL].crypto_seal =
+            self.pkt_num_spaces[packet::Epoch::Initial].crypto_seal =
                 Some(aead_seal);
 
             return Err(Error::Done);
@@ -2324,9 +2324,9 @@ impl Connection {
                 self.is_server,
             )?;
 
-            self.pkt_num_spaces[packet::EPOCH_INITIAL].crypto_open =
+            self.pkt_num_spaces[packet::Epoch::Initial].crypto_open =
                 Some(aead_open);
-            self.pkt_num_spaces[packet::EPOCH_INITIAL].crypto_seal =
+            self.pkt_num_spaces[packet::Epoch::Initial].crypto_seal =
                 Some(aead_seal);
 
             self.derived_initial_secrets = true;
@@ -2601,6 +2601,21 @@ impl Connection {
 
                         stream.send.ack_and_drop(offset, length);
 
+                        qlog_with_type!(QLOG_DATA_MV, self.qlog, q, {
+                            let ev_data = EventData::DataMoved(
+                                qlog::events::quic::DataMoved {
+                                    stream_id: Some(stream_id),
+                                    offset: Some(offset),
+                                    length: Some(length as u64),
+                                    from: Some(DataRecipient::Transport),
+                                    to: Some(DataRecipient::Dropped),
+                                    data: None,
+                                },
+                            );
+
+                            q.add_event_data_with_instant(ev_data, now).ok();
+                        });
+
                         // Only collect the stream if it is complete and not
                         // readable. If it is readable, it will get collected when
                         // stream_recv() is used.
@@ -2715,7 +2730,7 @@ impl Connection {
         // successfully processed, so we can drop the initial state and consider
         // the client's address to be verified.
         if self.is_server && hdr.ty == packet::Type::Handshake {
-            self.drop_epoch_state(packet::EPOCH_INITIAL, now);
+            self.drop_epoch_state(packet::Epoch::Initial, now);
 
             self.paths.get_mut(recv_pid)?.verified_peer_address = true;
         }
@@ -3195,13 +3210,15 @@ impl Connection {
         let hdr_ty = hdr.ty;
 
         #[cfg(feature = "qlog")]
-        let qlog_pkt_hdr = qlog::events::quic::PacketHeader::with_type(
-            hdr.ty.to_qlog(),
-            pn,
-            Some(hdr.version),
-            Some(&hdr.scid),
-            Some(&hdr.dcid),
-        );
+        let qlog_pkt_hdr = self.qlog.streamer.as_ref().map(|_q| {
+            qlog::events::quic::PacketHeader::with_type(
+                hdr.ty.to_qlog(),
+                pn,
+                Some(hdr.version),
+                Some(&hdr.scid),
+                Some(&hdr.dcid),
+            )
+        });
 
         // Calculate the space required for the packet, including the header
         // the payload length, the packet number and the AEAD overhead.
@@ -3966,30 +3983,37 @@ impl Connection {
         }
 
         qlog_with_type!(QLOG_PACKET_TX, self.qlog, q, {
-            // Qlog packet raw info described at
-            // https://datatracker.ietf.org/doc/html/draft-ietf-quic-qlog-main-schema-00#section-5.1
-            //
-            // `length` includes packet headers and trailers (AEAD tag).
-            let length = payload_len + payload_offset + crypto_overhead;
-            let qlog_raw_info = RawInfo {
-                length: Some(length as u64),
-                payload_length: Some(payload_len as u64),
-                data: None,
-            };
+            if let Some(header) = qlog_pkt_hdr {
+                // Qlog packet raw info described at
+                // https://datatracker.ietf.org/doc/html/draft-ietf-quic-qlog-main-schema-00#section-5.1
+                //
+                // `length` includes packet headers and trailers (AEAD tag).
+                let length = payload_len + payload_offset + crypto_overhead;
+                let qlog_raw_info = RawInfo {
+                    length: Some(length as u64),
+                    payload_length: Some(payload_len as u64),
+                    data: None,
+                };
 
-            let ev_data = EventData::PacketSent(qlog::events::quic::PacketSent {
-                header: qlog_pkt_hdr,
-                frames: Some(qlog_frames),
-                is_coalesced: None,
-                retry_token: None,
-                stateless_reset_token: None,
-                supported_versions: None,
-                raw: Some(qlog_raw_info),
-                datagram_id: None,
-                trigger: None,
-            });
+                let send_at_time =
+                    now.duration_since(q.start_time()).as_secs_f32() * 1000.0;
 
-            q.add_event_data_with_instant(ev_data, now).ok();
+                let ev_data =
+                    EventData::PacketSent(qlog::events::quic::PacketSent {
+                        header,
+                        frames: Some(qlog_frames),
+                        is_coalesced: None,
+                        retry_token: None,
+                        stateless_reset_token: None,
+                        supported_versions: None,
+                        raw: Some(qlog_raw_info),
+                        datagram_id: None,
+                        send_at_time: Some(send_at_time),
+                        trigger: None,
+                    });
+
+                q.add_event_data_with_instant(ev_data, now).ok();
+            }
         });
 
         let aead = match self.pkt_num_spaces[epoch].crypto_seal {
@@ -4071,7 +4095,7 @@ impl Connection {
 
         // On the client, drop initial state after sending an Handshake packet.
         if !self.is_server && hdr_ty == packet::Type::Handshake {
-            self.drop_epoch_state(packet::EPOCH_INITIAL, now);
+            self.drop_epoch_state(packet::Epoch::Initial, now);
         }
 
         self.paths.get_mut(send_pid)?.max_send_bytes = self
@@ -5044,7 +5068,7 @@ impl Connection {
                 max_len = max_len.saturating_sub(packet::MAX_PKT_NUM_LEN);
                 // ...subtract the crypto overhead...
                 max_len = max_len.saturating_sub(
-                    self.pkt_num_spaces[packet::EPOCH_APPLICATION]
+                    self.pkt_num_spaces[packet::Epoch::Application]
                         .crypto_overhead()?,
                 );
                 // ...clamp to what peer can support...
@@ -6033,13 +6057,13 @@ impl Connection {
             .map_or(false, |conn_err| !conn_err.is_app)
         {
             let epoch = match self.handshake.write_level() {
-                crypto::Level::Initial => packet::EPOCH_INITIAL,
+                crypto::Level::Initial => packet::Epoch::Initial,
                 crypto::Level::ZeroRTT => unreachable!(),
-                crypto::Level::Handshake => packet::EPOCH_HANDSHAKE,
-                crypto::Level::OneRTT => packet::EPOCH_APPLICATION,
+                crypto::Level::Handshake => packet::Epoch::Handshake,
+                crypto::Level::OneRTT => packet::Epoch::Application,
             };
 
-            if epoch == packet::EPOCH_APPLICATION && !self.is_established() {
+            if epoch == packet::Epoch::Application && !self.is_established() {
                 // Downgrade the epoch to handshake as the handshake is not
                 // completed yet.
                 return Ok(packet::Type::Handshake);
@@ -6048,7 +6072,9 @@ impl Connection {
             return Ok(packet::Type::from_epoch(epoch));
         }
 
-        for epoch in packet::EPOCH_INITIAL..packet::EPOCH_COUNT {
+        for &epoch in packet::Epoch::epochs(
+            packet::Epoch::Initial..=packet::Epoch::Application,
+        ) {
             // Only send packets in a space when we have the send keys for it.
             if self.pkt_num_spaces[epoch].crypto_seal.is_none() {
                 continue;
@@ -6140,13 +6166,13 @@ impl Connection {
                     ))
                     .ok_or(Error::InvalidFrame)?;
 
-                if epoch == packet::EPOCH_HANDSHAKE {
+                if epoch == packet::Epoch::Handshake {
                     self.peer_verified_initial_address = true;
                 }
 
                 // When we receive an ACK for a 1-RTT packet after handshake
                 // completion, it means the handshake has been confirmed.
-                if epoch == packet::EPOCH_APPLICATION && self.is_established() {
+                if epoch == packet::Epoch::Application && self.is_established() {
                     self.peer_verified_initial_address = true;
 
                     self.handshake_confirmed = true;
@@ -6175,7 +6201,7 @@ impl Connection {
                 }
 
                 if self.handshake_confirmed {
-                    self.drop_epoch_state(packet::EPOCH_HANDSHAKE, now);
+                    self.drop_epoch_state(packet::Epoch::Handshake, now);
                 }
             },
 
@@ -6554,7 +6580,7 @@ impl Connection {
                 self.handshake_confirmed = true;
 
                 // Once the handshake is confirmed, we can drop Handshake keys.
-                self.drop_epoch_state(packet::EPOCH_HANDSHAKE, now);
+                self.drop_epoch_state(packet::Epoch::Handshake, now);
             },
 
             frame::Frame::Datagram { data } => {
@@ -6662,7 +6688,7 @@ impl Connection {
     /// Returns the connection's handshake status for use in loss recovery.
     fn handshake_status(&self) -> recovery::HandshakeStatus {
         recovery::HandshakeStatus {
-            has_handshake_keys: self.pkt_num_spaces[packet::EPOCH_HANDSHAKE]
+            has_handshake_keys: self.pkt_num_spaces[packet::Epoch::Handshake]
                 .has_keys(),
 
             peer_verified_address: self.peer_verified_initial_address,
@@ -8804,7 +8830,7 @@ mod tests {
             .get_active_mut()
             .expect("no active path")
             .recovery
-            .loss_probes[packet::EPOCH_INITIAL] = 1;
+            .loss_probes[packet::Epoch::Initial] = 1;
 
         let initial_path = pipe
             .server
@@ -9625,7 +9651,7 @@ mod tests {
         // Note that `largest_rx_pkt_num` is initialized to 0, so we need to
         // send another 1-RTT packet to make this check meaningful.
         assert_eq!(
-            pipe.server.pkt_num_spaces[packet::EPOCH_APPLICATION]
+            pipe.server.pkt_num_spaces[packet::Epoch::Application]
                 .largest_rx_pkt_num,
             0
         );
@@ -9636,7 +9662,7 @@ mod tests {
         assert!(pipe.server.is_established());
 
         assert_eq!(
-            pipe.server.pkt_num_spaces[packet::EPOCH_APPLICATION]
+            pipe.server.pkt_num_spaces[packet::Epoch::Application]
                 .largest_rx_pkt_num,
             0
         );
@@ -11679,7 +11705,7 @@ mod tests {
         let mut pipe = testing::Pipe::default().unwrap();
         assert_eq!(pipe.handshake(), Ok(()));
 
-        let epoch = packet::EPOCH_APPLICATION;
+        let epoch = packet::Epoch::Application;
 
         assert_eq!(pipe.server.pkt_num_spaces[epoch].recv_pkt_need_ack.len(), 0);
 
@@ -12222,7 +12248,7 @@ mod tests {
 
         pipe.client.on_timeout();
 
-        let epoch = packet::EPOCH_APPLICATION;
+        let epoch = packet::Epoch::Application;
         assert_eq!(
             pipe.client
                 .paths
@@ -12280,7 +12306,7 @@ mod tests {
 
         pipe.client.on_timeout();
 
-        let epoch = packet::EPOCH_INITIAL;
+        let epoch = packet::Epoch::Initial;
         assert_eq!(
             pipe.client
                 .paths

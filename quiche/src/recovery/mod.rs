@@ -79,11 +79,12 @@ pub struct Recovery {
 
     pto_count: u32,
 
-    time_of_last_sent_ack_eliciting_pkt: [Option<Instant>; packet::EPOCH_COUNT],
+    time_of_last_sent_ack_eliciting_pkt:
+        [Option<Instant>; packet::Epoch::count()],
 
-    largest_acked_pkt: [u64; packet::EPOCH_COUNT],
+    largest_acked_pkt: [u64; packet::Epoch::count()],
 
-    largest_sent_pkt: [u64; packet::EPOCH_COUNT],
+    largest_sent_pkt: [u64; packet::Epoch::count()],
 
     latest_rtt: Duration,
 
@@ -97,21 +98,21 @@ pub struct Recovery {
 
     pub max_ack_delay: Duration,
 
-    loss_time: [Option<Instant>; packet::EPOCH_COUNT],
+    loss_time: [Option<Instant>; packet::Epoch::count()],
 
-    sent: [VecDeque<Sent>; packet::EPOCH_COUNT],
+    sent: [VecDeque<Sent>; packet::Epoch::count()],
 
-    pub lost: [Vec<frame::Frame>; packet::EPOCH_COUNT],
+    pub lost: [Vec<frame::Frame>; packet::Epoch::count()],
 
-    pub acked: [Vec<frame::Frame>; packet::EPOCH_COUNT],
+    pub acked: [Vec<frame::Frame>; packet::Epoch::count()],
 
     pub lost_count: usize,
 
     pub lost_spurious_count: usize,
 
-    pub loss_probes: [usize; packet::EPOCH_COUNT],
+    pub loss_probes: [usize; packet::Epoch::count()],
 
-    in_flight_count: [usize; packet::EPOCH_COUNT],
+    in_flight_count: [usize; packet::Epoch::count()],
 
     app_limited: bool,
 
@@ -197,11 +198,11 @@ impl Recovery {
 
             pto_count: 0,
 
-            time_of_last_sent_ack_eliciting_pkt: [None; packet::EPOCH_COUNT],
+            time_of_last_sent_ack_eliciting_pkt: [None; packet::Epoch::count()],
 
-            largest_acked_pkt: [std::u64::MAX; packet::EPOCH_COUNT],
+            largest_acked_pkt: [std::u64::MAX; packet::Epoch::count()],
 
-            largest_sent_pkt: [0; packet::EPOCH_COUNT],
+            largest_sent_pkt: [0; packet::Epoch::count()],
 
             latest_rtt: Duration::ZERO,
 
@@ -219,7 +220,7 @@ impl Recovery {
 
             max_ack_delay: recovery_config.max_ack_delay,
 
-            loss_time: [None; packet::EPOCH_COUNT],
+            loss_time: [None; packet::Epoch::count()],
 
             sent: [VecDeque::new(), VecDeque::new(), VecDeque::new()],
 
@@ -230,9 +231,9 @@ impl Recovery {
             lost_count: 0,
             lost_spurious_count: 0,
 
-            loss_probes: [0; packet::EPOCH_COUNT],
+            loss_probes: [0; packet::Epoch::count()],
 
-            in_flight_count: [0; packet::EPOCH_COUNT],
+            in_flight_count: [0; packet::Epoch::count()],
 
             congestion_window: initial_congestion_window,
 
@@ -296,7 +297,7 @@ impl Recovery {
 
     pub fn reset(&mut self) {
         self.congestion_window = self.max_datagram_size * INITIAL_WINDOW_PACKETS;
-        self.in_flight_count = [0; packet::EPOCH_COUNT];
+        self.in_flight_count = [0; packet::Epoch::count()];
         self.congestion_recovery_start_time = None;
         self.ssthresh = std::usize::MAX;
         (self.cc_ops.reset)(self);
@@ -350,7 +351,7 @@ impl Recovery {
 
         // HyStart++: Start of the round in a slow start.
         if self.hystart.enabled() &&
-            epoch == packet::EPOCH_APPLICATION &&
+            epoch == packet::Epoch::Application &&
             self.congestion_window < self.ssthresh
         {
             self.hystart.start_round(pkt_num);
@@ -396,10 +397,10 @@ impl Recovery {
     ) {
         // Don't pace in any of these cases:
         //   * Packet contains no data.
-        //   * Packet epoch is not EPOCH_APPLICATION.
+        //   * Packet epoch is not Epoch::Application.
         //   * The congestion window is within initcwnd.
 
-        let is_app = epoch == packet::EPOCH_APPLICATION;
+        let is_app = epoch == packet::Epoch::Application;
 
         let in_initcwnd =
             self.bytes_sent < self.max_datagram_size * INITIAL_WINDOW_PACKETS;
@@ -543,7 +544,7 @@ impl Recovery {
             let latest_rtt =
                 now.saturating_duration_since(largest_newly_acked_sent_time);
 
-            let ack_delay = if epoch == packet::EPOCH_APPLICATION {
+            let ack_delay = if epoch == packet::Epoch::Application {
                 Duration::from_micros(ack_delay)
             } else {
                 Duration::from_micros(0)
@@ -599,9 +600,9 @@ impl Recovery {
             // more anti-amplification credit, a Handshake packet proves address
             // ownership.
             if handshake_status.has_handshake_keys {
-                packet::EPOCH_HANDSHAKE
+                packet::Epoch::Handshake
             } else {
-                packet::EPOCH_INITIAL
+                packet::Epoch::Initial
             }
         };
 
@@ -757,11 +758,13 @@ impl Recovery {
     }
 
     fn loss_time_and_space(&self) -> (Option<Instant>, packet::Epoch) {
-        let mut epoch = packet::EPOCH_INITIAL;
+        let mut epoch = packet::Epoch::Initial;
         let mut time = self.loss_time[epoch];
 
         // Iterate over all packet number spaces starting from Handshake.
-        for e in packet::EPOCH_HANDSHAKE..packet::EPOCH_COUNT {
+        for &e in packet::Epoch::epochs(
+            packet::Epoch::Handshake..=packet::Epoch::Application,
+        ) {
             let new_time = self.loss_time[e];
 
             if time.is_none() || new_time < time {
@@ -781,22 +784,24 @@ impl Recovery {
         // Arm PTO from now when there are no inflight packets.
         if self.bytes_in_flight == 0 {
             if handshake_status.has_handshake_keys {
-                return (Some(now + duration), packet::EPOCH_HANDSHAKE);
+                return (Some(now + duration), packet::Epoch::Handshake);
             } else {
-                return (Some(now + duration), packet::EPOCH_INITIAL);
+                return (Some(now + duration), packet::Epoch::Initial);
             }
         }
 
         let mut pto_timeout = None;
-        let mut pto_space = packet::EPOCH_INITIAL;
+        let mut pto_space = packet::Epoch::Initial;
 
         // Iterate over all packet number spaces.
-        for e in packet::EPOCH_INITIAL..packet::EPOCH_COUNT {
+        for &e in packet::Epoch::epochs(
+            packet::Epoch::Initial..=packet::Epoch::Application,
+        ) {
             if self.in_flight_count[e] == 0 {
                 continue;
             }
 
-            if e == packet::EPOCH_APPLICATION {
+            if e == packet::Epoch::Application {
                 // Skip Application Data until handshake completes.
                 if !handshake_status.completed {
                     return (pto_timeout, pto_space);
@@ -1031,6 +1036,7 @@ impl Recovery {
             cwnd: self.cwnd() as u64,
             bytes_in_flight: self.bytes_in_flight as u64,
             ssthresh: self.ssthresh as u64,
+            pacing_rate: self.pacer.rate(),
         };
 
         self.qlog_metrics.maybe_update(qlog_metrics)
@@ -1272,6 +1278,7 @@ struct QlogMetrics {
     cwnd: u64,
     bytes_in_flight: u64,
     ssthresh: u64,
+    pacing_rate: u64,
 }
 
 #[cfg(feature = "qlog")]
@@ -1341,6 +1348,14 @@ impl QlogMetrics {
             None
         };
 
+        let new_pacing_rate = if self.pacing_rate != latest.pacing_rate {
+            self.pacing_rate = latest.pacing_rate;
+            emit_event = true;
+            Some(latest.pacing_rate)
+        } else {
+            None
+        };
+
         if emit_event {
             // QVis can't use all these fields and they can be large.
             return Some(EventData::MetricsUpdated(
@@ -1354,7 +1369,7 @@ impl QlogMetrics {
                     bytes_in_flight: new_bytes_in_flight,
                     ssthresh: new_ssthresh,
                     packets_in_flight: None,
-                    pacing_rate: None,
+                    pacing_rate: new_pacing_rate,
                 },
             ));
         }
@@ -1402,7 +1417,7 @@ mod tests {
 
         let mut now = Instant::now();
 
-        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 0);
+        assert_eq!(r.sent[packet::Epoch::Application].len(), 0);
 
         // Start by sending a few packets.
         let p = Sent {
@@ -1423,12 +1438,12 @@ mod tests {
 
         r.on_packet_sent(
             p,
-            packet::EPOCH_APPLICATION,
+            packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
             "",
         );
-        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 1);
+        assert_eq!(r.sent[packet::Epoch::Application].len(), 1);
         assert_eq!(r.bytes_in_flight, 1000);
 
         let p = Sent {
@@ -1449,12 +1464,12 @@ mod tests {
 
         r.on_packet_sent(
             p,
-            packet::EPOCH_APPLICATION,
+            packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
             "",
         );
-        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 2);
+        assert_eq!(r.sent[packet::Epoch::Application].len(), 2);
         assert_eq!(r.bytes_in_flight, 2000);
 
         let p = Sent {
@@ -1475,12 +1490,12 @@ mod tests {
 
         r.on_packet_sent(
             p,
-            packet::EPOCH_APPLICATION,
+            packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
             "",
         );
-        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 3);
+        assert_eq!(r.sent[packet::Epoch::Application].len(), 3);
         assert_eq!(r.bytes_in_flight, 3000);
 
         let p = Sent {
@@ -1501,12 +1516,12 @@ mod tests {
 
         r.on_packet_sent(
             p,
-            packet::EPOCH_APPLICATION,
+            packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
             "",
         );
-        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 4);
+        assert_eq!(r.sent[packet::Epoch::Application].len(), 4);
         assert_eq!(r.bytes_in_flight, 4000);
 
         // Wait for 10ms.
@@ -1520,7 +1535,7 @@ mod tests {
             r.on_ack_received(
                 &acked,
                 25,
-                packet::EPOCH_APPLICATION,
+                packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
                 ""
@@ -1528,7 +1543,7 @@ mod tests {
             Ok((0, 0))
         );
 
-        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 2);
+        assert_eq!(r.sent[packet::Epoch::Application].len(), 2);
         assert_eq!(r.bytes_in_flight, 2000);
         assert_eq!(r.lost_count, 0);
 
@@ -1537,7 +1552,7 @@ mod tests {
 
         // PTO.
         r.on_loss_detection_timeout(HandshakeStatus::default(), now, "");
-        assert_eq!(r.loss_probes[packet::EPOCH_APPLICATION], 1);
+        assert_eq!(r.loss_probes[packet::Epoch::Application], 1);
         assert_eq!(r.lost_count, 0);
         assert_eq!(r.pto_count, 1);
 
@@ -1559,12 +1574,12 @@ mod tests {
 
         r.on_packet_sent(
             p,
-            packet::EPOCH_APPLICATION,
+            packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
             "",
         );
-        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 3);
+        assert_eq!(r.sent[packet::Epoch::Application].len(), 3);
         assert_eq!(r.bytes_in_flight, 3000);
 
         let p = Sent {
@@ -1585,12 +1600,12 @@ mod tests {
 
         r.on_packet_sent(
             p,
-            packet::EPOCH_APPLICATION,
+            packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
             "",
         );
-        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 4);
+        assert_eq!(r.sent[packet::Epoch::Application].len(), 4);
         assert_eq!(r.bytes_in_flight, 4000);
         assert_eq!(r.lost_count, 0);
 
@@ -1605,7 +1620,7 @@ mod tests {
             r.on_ack_received(
                 &acked,
                 25,
-                packet::EPOCH_APPLICATION,
+                packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
                 ""
@@ -1613,7 +1628,7 @@ mod tests {
             Ok((2, 2000))
         );
 
-        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 4);
+        assert_eq!(r.sent[packet::Epoch::Application].len(), 4);
         assert_eq!(r.bytes_in_flight, 0);
 
         assert_eq!(r.lost_count, 2);
@@ -1621,9 +1636,9 @@ mod tests {
         // Wait 1 RTT.
         now += r.rtt();
 
-        r.detect_lost_packets(packet::EPOCH_APPLICATION, now, "");
+        r.detect_lost_packets(packet::Epoch::Application, now, "");
 
-        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 0);
+        assert_eq!(r.sent[packet::Epoch::Application].len(), 0);
     }
 
     #[test]
@@ -1635,7 +1650,7 @@ mod tests {
 
         let mut now = Instant::now();
 
-        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 0);
+        assert_eq!(r.sent[packet::Epoch::Application].len(), 0);
 
         // Start by sending a few packets.
         let p = Sent {
@@ -1656,12 +1671,12 @@ mod tests {
 
         r.on_packet_sent(
             p,
-            packet::EPOCH_APPLICATION,
+            packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
             "",
         );
-        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 1);
+        assert_eq!(r.sent[packet::Epoch::Application].len(), 1);
         assert_eq!(r.bytes_in_flight, 1000);
 
         let p = Sent {
@@ -1682,12 +1697,12 @@ mod tests {
 
         r.on_packet_sent(
             p,
-            packet::EPOCH_APPLICATION,
+            packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
             "",
         );
-        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 2);
+        assert_eq!(r.sent[packet::Epoch::Application].len(), 2);
         assert_eq!(r.bytes_in_flight, 2000);
 
         let p = Sent {
@@ -1708,12 +1723,12 @@ mod tests {
 
         r.on_packet_sent(
             p,
-            packet::EPOCH_APPLICATION,
+            packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
             "",
         );
-        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 3);
+        assert_eq!(r.sent[packet::Epoch::Application].len(), 3);
         assert_eq!(r.bytes_in_flight, 3000);
 
         let p = Sent {
@@ -1734,12 +1749,12 @@ mod tests {
 
         r.on_packet_sent(
             p,
-            packet::EPOCH_APPLICATION,
+            packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
             "",
         );
-        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 4);
+        assert_eq!(r.sent[packet::Epoch::Application].len(), 4);
         assert_eq!(r.bytes_in_flight, 4000);
 
         // Wait for 10ms.
@@ -1754,7 +1769,7 @@ mod tests {
             r.on_ack_received(
                 &acked,
                 25,
-                packet::EPOCH_APPLICATION,
+                packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
                 ""
@@ -1762,7 +1777,7 @@ mod tests {
             Ok((0, 0))
         );
 
-        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 2);
+        assert_eq!(r.sent[packet::Epoch::Application].len(), 2);
         assert_eq!(r.bytes_in_flight, 1000);
         assert_eq!(r.lost_count, 0);
 
@@ -1771,9 +1786,9 @@ mod tests {
 
         // Packet is declared lost.
         r.on_loss_detection_timeout(HandshakeStatus::default(), now, "");
-        assert_eq!(r.loss_probes[packet::EPOCH_APPLICATION], 0);
+        assert_eq!(r.loss_probes[packet::Epoch::Application], 0);
 
-        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 2);
+        assert_eq!(r.sent[packet::Epoch::Application].len(), 2);
         assert_eq!(r.bytes_in_flight, 0);
 
         assert_eq!(r.lost_count, 1);
@@ -1781,9 +1796,9 @@ mod tests {
         // Wait 1 RTT.
         now += r.rtt();
 
-        r.detect_lost_packets(packet::EPOCH_APPLICATION, now, "");
+        r.detect_lost_packets(packet::Epoch::Application, now, "");
 
-        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 0);
+        assert_eq!(r.sent[packet::Epoch::Application].len(), 0);
     }
 
     #[test]
@@ -1795,7 +1810,7 @@ mod tests {
 
         let mut now = Instant::now();
 
-        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 0);
+        assert_eq!(r.sent[packet::Epoch::Application].len(), 0);
 
         // Start by sending a few packets.
         let p = Sent {
@@ -1816,12 +1831,12 @@ mod tests {
 
         r.on_packet_sent(
             p,
-            packet::EPOCH_APPLICATION,
+            packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
             "",
         );
-        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 1);
+        assert_eq!(r.sent[packet::Epoch::Application].len(), 1);
         assert_eq!(r.bytes_in_flight, 1000);
 
         let p = Sent {
@@ -1842,12 +1857,12 @@ mod tests {
 
         r.on_packet_sent(
             p,
-            packet::EPOCH_APPLICATION,
+            packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
             "",
         );
-        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 2);
+        assert_eq!(r.sent[packet::Epoch::Application].len(), 2);
         assert_eq!(r.bytes_in_flight, 2000);
 
         let p = Sent {
@@ -1868,12 +1883,12 @@ mod tests {
 
         r.on_packet_sent(
             p,
-            packet::EPOCH_APPLICATION,
+            packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
             "",
         );
-        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 3);
+        assert_eq!(r.sent[packet::Epoch::Application].len(), 3);
         assert_eq!(r.bytes_in_flight, 3000);
 
         let p = Sent {
@@ -1894,12 +1909,12 @@ mod tests {
 
         r.on_packet_sent(
             p,
-            packet::EPOCH_APPLICATION,
+            packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
             "",
         );
-        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 4);
+        assert_eq!(r.sent[packet::Epoch::Application].len(), 4);
         assert_eq!(r.bytes_in_flight, 4000);
 
         // Wait for 10ms.
@@ -1913,7 +1928,7 @@ mod tests {
             r.on_ack_received(
                 &acked,
                 25,
-                packet::EPOCH_APPLICATION,
+                packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
                 ""
@@ -1932,7 +1947,7 @@ mod tests {
             r.on_ack_received(
                 &acked,
                 25,
-                packet::EPOCH_APPLICATION,
+                packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
                 ""
@@ -1940,7 +1955,7 @@ mod tests {
             Ok((0, 0))
         );
 
-        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 4);
+        assert_eq!(r.sent[packet::Epoch::Application].len(), 4);
         assert_eq!(r.bytes_in_flight, 0);
 
         // Spurious loss.
@@ -1953,9 +1968,9 @@ mod tests {
         // Wait 1 RTT.
         now += r.rtt();
 
-        r.detect_lost_packets(packet::EPOCH_APPLICATION, now, "");
+        r.detect_lost_packets(packet::Epoch::Application, now, "");
 
-        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 0);
+        assert_eq!(r.sent[packet::Epoch::Application].len(), 0);
     }
 
     #[test]
@@ -1967,7 +1982,7 @@ mod tests {
 
         let mut now = Instant::now();
 
-        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 0);
+        assert_eq!(r.sent[packet::Epoch::Application].len(), 0);
 
         // send out first packet (a full initcwnd).
         let p = Sent {
@@ -1988,13 +2003,13 @@ mod tests {
 
         r.on_packet_sent(
             p,
-            packet::EPOCH_APPLICATION,
+            packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
             "",
         );
 
-        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 1);
+        assert_eq!(r.sent[packet::Epoch::Application].len(), 1);
         assert_eq!(r.bytes_in_flight, 12000);
 
         // First packet will be sent out immediately.
@@ -2011,7 +2026,7 @@ mod tests {
             r.on_ack_received(
                 &acked,
                 10,
-                packet::EPOCH_APPLICATION,
+                packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
                 ""
@@ -2019,7 +2034,7 @@ mod tests {
             Ok((0, 0))
         );
 
-        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 0);
+        assert_eq!(r.sent[packet::Epoch::Application].len(), 0);
         assert_eq!(r.bytes_in_flight, 0);
         assert_eq!(r.smoothed_rtt.unwrap(), Duration::from_millis(50));
 
@@ -2045,13 +2060,13 @@ mod tests {
 
         r.on_packet_sent(
             p,
-            packet::EPOCH_APPLICATION,
+            packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
             "",
         );
 
-        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 1);
+        assert_eq!(r.sent[packet::Epoch::Application].len(), 1);
         assert_eq!(r.bytes_in_flight, 6000);
 
         // Pacing is not done during initial phase of connection.
@@ -2076,13 +2091,13 @@ mod tests {
 
         r.on_packet_sent(
             p,
-            packet::EPOCH_APPLICATION,
+            packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
             "",
         );
 
-        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 2);
+        assert_eq!(r.sent[packet::Epoch::Application].len(), 2);
         assert_eq!(r.bytes_in_flight, 12000);
 
         // Send the third packet out.
@@ -2104,13 +2119,13 @@ mod tests {
 
         r.on_packet_sent(
             p,
-            packet::EPOCH_APPLICATION,
+            packet::Epoch::Application,
             HandshakeStatus::default(),
             now,
             "",
         );
 
-        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 3);
+        assert_eq!(r.sent[packet::Epoch::Application].len(), 3);
         assert_eq!(r.bytes_in_flight, 13000);
 
         // We pace this outgoing packet. as all conditions for pacing
