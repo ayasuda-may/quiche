@@ -49,7 +49,7 @@ pub const SETTINGS_QPACK_BLOCKED_STREAMS: u64 = 0x7;
 pub const SETTINGS_H3_DATAGRAM: u64 = 0xffd277;
 //pub const SETTINGS_H3_DATAGRAM: u64 = 0x276;
 
-// https://www.ietf.org/id/draft-ietf-webtrans-http3-02.html#section-8.2-3.4.1
+//https://www.ietf.org/archive/id/draft-ietf-webtrans-http3-03.html#section-8.2
 pub const SETTINGS_ENABLE_WEBTRANSPORT: u64 = 0x2b603742;
 
 pub const SETTINGS_ENABLE_CONNECT_PROTOCOL: u64 = 0x8;

@@ -236,7 +236,7 @@ impl Stream {
 
         self.ty = Some(ty);
 
-        let state = match &ty {
+        let state = match ty {
             Type::Control | Type::Request => State::FrameType,
 
             Type::WebTransport => State::WebTransportSessionId,
@@ -318,20 +318,20 @@ impl Stream {
                 if !self.is_local {
                     match (ty, self.remote_initialized) {
                         (frame::HEADERS_FRAME_TYPE_ID, false) =>
-                            self.remote_initialized = true,
-
-                        (frame::DATA_FRAME_TYPE_ID, false) =>
-                            return Err(Error::FrameUnexpected),
-
+                            self.remote_initialized = true,			
+                        
                         (frame::WEBTRANSPORT_FRAME_TYPE_ID, true) => {
                             self.local_initialized = true;
                             next_state = State::WebTransportSessionId;
                         }
 
-                        (frame::WEBTRANSPORT_FRAME_TYPE_ID, false) => {
+			(frame::WEBTRANSPORT_FRAME_TYPE_ID, false) => {
                             self.remote_initialized = true;
                             next_state = State::WebTransportSessionId;
                         }
+
+                        (frame::DATA_FRAME_TYPE_ID, false) =>
+                            return Err(Error::FrameUnexpected),
 
                         (frame::CANCEL_PUSH_FRAME_TYPE_ID, _) =>
                             return Err(Error::FrameUnexpected),
@@ -351,6 +351,12 @@ impl Stream {
                     }
                 } else {
                     match (ty, self.remote_initialized) {
+			(frame::HEADERS_FRAME_TYPE_ID, false) =>
+			    return Err(Error::FrameUnexpected),
+
+                        (frame::DATA_FRAME_TYPE_ID, false) =>
+                            return Err(Error::FrameUnexpected),
+
                         (frame::WEBTRANSPORT_FRAME_TYPE_ID, true) =>
                             return Err(Error::FrameUnexpected),
 
@@ -403,8 +409,12 @@ impl Stream {
 
         self.frame_type = Some(ty);
 
-        self.state_transition(next_state, 1, true)?;
-
+	if next_state == State::WebTransportSessionId {    
+            self.state_transition(next_state, 1, true)?;
+	} else {
+	    self.state_transition(State::FramePayloadLen, 1, true)?;
+	}
+	
         Ok(())
     }
 

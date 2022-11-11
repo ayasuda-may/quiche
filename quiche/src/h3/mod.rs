@@ -907,9 +907,9 @@ impl Connection {
                 max_field_section_size: config.max_field_section_size,
                 qpack_max_table_capacity: config.qpack_max_table_capacity,
                 qpack_blocked_streams: config.qpack_blocked_streams,
+                h3_datagram,
                 enable_webtransport: if config.enable_webtransport { Some(1) } else { None },
                 connect_protocol_enabled: config.connect_protocol_enabled,
-                h3_datagram,
                 raw: Default::default(),
             },
 
