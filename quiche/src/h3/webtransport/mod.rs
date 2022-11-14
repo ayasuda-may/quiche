@@ -1914,3 +1914,5 @@ mod tests {
         assert_eq!(s.poll_client(), Err(Error::Done));
     }
 }
+
+pub mod ffi;

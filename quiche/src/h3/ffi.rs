@@ -150,6 +150,8 @@ pub extern fn quiche_h3_event_type(ev: &h3::Event) -> u32 {
         h3::Event::Reset { .. } => 5,
 
         h3::Event::PriorityUpdate { .. } => 6,
+
+	h3::Event::WebTransportStreamData(_) => 7,
     }
 }
 

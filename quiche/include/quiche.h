@@ -918,6 +918,11 @@ ssize_t quiche_h3_recv_dgram(quiche_h3_conn *conn, quiche_conn *quic_conn,
 // Frees the HTTP/3 connection object.
 void quiche_h3_conn_free(quiche_h3_conn *conn);
 
+void quiche_h3_webtransport_conn_new_with_transport(
+    quic_conn: &mut Connection,
+) -> *mut h3::webtransport::ServerSession {
+
+  
 #if defined(__cplusplus)
 }  // extern C
 #endif

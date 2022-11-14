@@ -54,10 +54,12 @@ impl Type {
         match self {
             Type::Control => qlog::events::h3::H3StreamType::Control,
             Type::Request => qlog::events::h3::H3StreamType::Data,
+            //Type::WebTransport => qlog::events::h3::H3StreamType::Data,
             Type::Push => qlog::events::h3::H3StreamType::Push,
             Type::QpackEncoder => qlog::events::h3::H3StreamType::QpackEncode,
             Type::QpackDecoder => qlog::events::h3::H3StreamType::QpackDecode,
-            Type::Unknown => qlog::events::h3::H3StreamType::Unknown,
+            //Type::Unknown => qlog::events::h3::H3StreamType::Unknown,
+	    _ => qlog::events::h3::H3StreamType::Unknown,
         }
     }
 }
