@@ -1,3 +1,6 @@
+This branch is actively maintained as a merging candidate for webtransport-related implementation based on the [latetst IETF draft (v4)](https://www.ietf.org/archive/id/draft-ietf-webtrans-overview-04.html) Any PRs are welcome. All implementation have been tested and is current to [quiche 0.16.x](https://github.com/cloudflare/quiche).
+
+
 ![quiche](quiche.svg)
 
 [![crates.io](https://img.shields.io/crates/v/quiche.svg)](https://crates.io/crates/quiche)
