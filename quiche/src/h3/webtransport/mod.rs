@@ -751,7 +751,7 @@ impl ServerSession {
 	    /// priority update available in 0.14.0
 	    /// optional event implementation for webtransport
 	    /// TBC A. Yasuda
-	    Ok((_, PriorityUpdate)) => {
+	    Ok((_, h3::Event::PriorityUpdate)) => {
 		
 		debug!("PriorityUpdate event emitted. pending implementation");	
 		//todo!()
