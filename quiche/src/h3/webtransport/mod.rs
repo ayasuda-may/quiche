@@ -751,7 +751,12 @@ impl ServerSession {
 	    /// priority update available in 0.14.0
 	    /// optional event implementation for webtransport
 	    /// TBC A. Yasuda
-	    Ok((_, PriorityUpdate)) => todo!(),
+	    Ok((_, PriorityUpdate)) => {
+		
+		debug!("PriorityUpdate event emitted. pending implementation");	
+		//todo!()
+                Ok(ServerEvent::SessionFinished)
+	    },
 	    
             Ok((stream_id, h3::Event::WebTransportStreamData(session_id))) => {
                 match self.state {
@@ -1240,7 +1245,7 @@ impl ClientSession {
 	    /// optional event implementation for webtransport
 	    /// client request
 	    /// TBC A. Yasuda
-	    Ok((_, PriorityUpdate)) => todo!(),
+	    Ok((_, h3::Event::PriorityUpdate)) => todo!(),
 	    
             Err(h3::Error::Done) => Err(Error::Done),
 
